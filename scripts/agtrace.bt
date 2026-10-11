@@ -1,0 +1,245 @@
+/*
+ * agtrace.bt — 单一 bpftrace 脚本，4 个 probe group（DESIGN.md §2.2）
+ *
+ * 本文件是**模板**，由 src/collector/bpftrace.rs 在运行时展开。
+ * 占位符名两侧用成对的 @ 包起来（下面为了不让本文档自己也被当成占位符，只写名字）：
+ *   SEEDS        →  `@in_tree[<pid>] = 1;` 若干行（--pid 模式，含 attach 时扫 /proc 得到的后代）
+ *   FILTER       →  `@in_tree[pid]`  或  `cgroup == <id>`（--cgroup 模式）
+ *   ARGV_CAPTURE →  argv stash 捕获（--argv-max 行）
+ *   ARGV_PRINT   →  argv 回吐（--argv-max 行）
+ *   ARGV_DELETE  →  argv stash 清理
+ *   ARGV_SLOTS   →  argv 槽位数（--argv-max）
+ *   SRC_EXEC     →  1/0，是否产出 exec/fork/exit 事件（--source）
+ *   SRC_FILE     →  1/0，是否产出 openat 事件
+ *   SRC_NET      →  1/0，是否产出 connect/sendto 事件
+ *   FILE_PRED    →  写意图过滤（默认）或 `1`（--file-all）
+ *
+ * **为什么用 1/0 常量而不是删掉整个 group**：pid-tree 维护（@in_tree）是 file/net
+ * 两组过滤器的前提，所以 fork 探测与种子初始化必须**永远**保留。--source 只控制
+ * *产出*，不控制*过滤*。代价是关掉的一组仍会跑 probe body（很便宜），这是 v0 的取舍。
+ *
+ * 行协议（`|` 分隔；**每行最后一个字段是唯一可能含 `|` 的字段**，Rust 用 splitn 解析）：
+ *   EXEC|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<slots>|<comm>|<filename>
+ *   FAIL|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<slots>|<ret>|<comm>|<filename>
+ *   ARGV|<nsecs>|<pid>|<tid>|<idx>|<value>     —— 紧跟在 EXEC/FAIL 之后，共 <slots> 行
+ *   FORK|<nsecs>|<pid>|<ppid>|<cgroup>|<child_pid>|<child_comm>|<parent_comm>
+ *   EXIT|<nsecs>|<pid>|<ppid>|<cgroup>|<exit_code>|<comm>
+ *   OPEN|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<flags_hex>|<dirfd>|<ret>|<path>
+ *   CONN|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<fd>|<family>|<port>|<ret>|<addr>
+ *   SEND|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<fd>|<len>
+ *   TICK|<nsecs>          —— 心跳，证明采集器仍活着（也用于 stash 定期清理）
+ *
+ * 实测踩过的坑（DESIGN.md §5.5 + 本次实现新增，均在 kernel 7.0.0-31-generic /
+ * bpftrace v0.20.2 上实测）：
+ *  1. 不能用 `comm` 过滤 exec —— sys_enter_execve 时 comm 还是父进程名。
+ *     **本脚本的改进**：exec 事件不从 sys_enter_execve 产出，而是从
+ *     tracepoint:sched:sched_process_exec 产出 —— 该 tracepoint 触发时 comm
+ *     **已经是新二进制的名字**（实测 `/bin/echo` → comm=echo）。sys_enter_execve
+ *     只用来 stash argv。这样 comm 是 truthful 的，且 exec 事件只在成功时产出。
+ *  2. 不能用 bpftrace `-p` 做 syscall 过滤（那只管 USDT）→ 必须自己写 @in_tree。
+ *  3. `unroll(N)` 不提供下标变量 → 必须写死常量下标（占位符 ARGV_0..N 展开成 N 行）。
+ *  4. 不能用 `(char **)` 强转（BTF 下报 Cannot resolve unknown type "char"）→ 用 (uint64*)。
+ *  5. 端口必须 `bswap()` —— 否则 redis 6379 显示成 60184。
+ *  6. 必须 `-B none`，且 Rust 直连 stdout（中间夹 grep 会因块缓冲假死）。
+ *  7. `sys_exit_openat` 没有 filename 字段 → 必须 stash map 配对。
+ *  8. **新增实测**：`/@stash[tid]/` 作为 predicate 会报
+ *     `Invalid type for predicate: string`（v0.20.2）。字符串 map 不能直接当谓词
+ *     → 必须另开一个整数 map `@has[tid]` 做存在性判断。
+ *  9. **新增实测**：`str(ptr, N)` 的 N **无效** —— 实测 str(x)/str(x,256)/str(x,1024)
+ *     输出完全相同，硬上限 64 字节，超出部分打印 `..`。真正的杠杆是环境变量
+ *     `BPFTRACE_MAX_STRLEN`（上限 200，因为字符串存 512 字节 BPF 栈）。
+ *     Rust 端据此设置 BPFTRACE_MAX_STRLEN=200，并把以 `..` 结尾的字段记入 `trunc`。
+ * 10. **新增实测**：v0.20.2 没有 `sprintf()`，IPv6 用 `ntop(...sin6_addr.in6_u.u6_addr8)`。
+ * 11. **新增实测**：一条 printf 里 `%s` 的个数受 512 字节 BPF 栈限制 ——
+ *     默认 MAX_STRLEN=64 时最多 6 个 `%s`，第 7 个就报
+ *     `Looks like the BPF stack limit is exceeded`。DESIGN.md 的 `--argv-max 8`
+ *     单行输出方案**编译不过**。→ 改为 EXEC 行 + N 行 ARGV 的两段式协议：
+ *     EXEC 行只带 2 个 `%s`（comm、filename），argv 每行一个 `%s` 跟在后面。
+ *     这些 printf 在**同一个 probe body 内顺序执行**，写入同一个 perf buffer，
+ *     因此 ARGV 行与它的 EXEC 行必然连续（同 CPU、不可抢占）→ 可安全重组。
+ */
+
+BEGIN
+{
+@@SEEDS@@
+}
+
+// ===========================================================================
+// 进程树维护 —— **永远启用**，与 --source 无关（见文件头说明）
+// ===========================================================================
+tracepoint:sched:sched_process_fork
+{
+    if (@@FILTER@@) {
+        @in_tree[args->child_pid] = 1;
+        if (@@SRC_EXEC@@) {
+            printf("FORK|%llu|%d|%d|%llu|%d|%s|%s\n",
+                   nsecs, pid, curtask->real_parent->pid, cgroup,
+                   args->child_pid, str(args->child_comm, 16), comm);
+        }
+    }
+}
+
+tracepoint:sched:sched_process_exit
+/@@FILTER@@/
+{
+    if (@@SRC_EXEC@@) {
+        printf("EXIT|%llu|%d|%d|%llu|%d|%s\n",
+               nsecs, pid, curtask->real_parent->pid, cgroup,
+               curtask->exit_code >> 8, comm);
+    }
+    // 树成员退出即移除，避免 map 无界增长（pid 复用风险 v0 接受，见 §5.2）
+    delete(@in_tree[pid]);
+}
+
+// ===========================================================================
+// GROUP: exec —— 命令执行（DESIGN.md §2.2 Group A）
+// ===========================================================================
+// argv 只能在 enter 时拿到；comm 在 enter 时是父进程的（坑 #1），所以这里不产出 exec 事件。
+tracepoint:syscalls:sys_enter_execve
+/@@FILTER@@ && @@SRC_EXEC@@/
+{
+    $a = (uint64*)args->argv;
+    @argv_fn[tid] = str(args->filename, 200);
+    @argv_has[tid] = 1;
+@@ARGV_CAPTURE@@
+}
+
+// 真正产出 exec 事件的地方：comm 已是新名字，且只在 exec 成功时触发。
+tracepoint:sched:sched_process_exec
+/@@FILTER@@ && @@SRC_EXEC@@/
+{
+    printf("EXEC|%llu|%d|%d|%d|%llu|%d|%s|%s\n",
+           nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+           @@ARGV_SLOTS@@, comm, str(args->filename, 200));
+@@ARGV_PRINT@@
+    delete(@argv_fn[tid]); delete(@argv_has[tid]);
+@@ARGV_DELETE@@
+}
+
+// exec 失败（ENOENT/EACCES/...）走这里 —— sched_process_exec 不会触发。
+tracepoint:syscalls:sys_exit_execve
+/@argv_has[tid] == 1 && args->ret < 0/
+{
+    printf("FAIL|%llu|%d|%d|%d|%llu|%d|%d|%s|%s\n",
+           nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+           @@ARGV_SLOTS@@, args->ret, comm, @argv_fn[tid]);
+@@ARGV_PRINT@@
+    delete(@argv_fn[tid]); delete(@argv_has[tid]);
+@@ARGV_DELETE@@
+}
+
+// ===========================================================================
+// GROUP: file —— 文件打开（DESIGN.md §2.2 Group B）
+// ===========================================================================
+// enter 只 stash，不产出（sys_exit_openat 没有 filename，坑 #7）。
+// 默认只记**写意图**的 open：openat 是极端高频事件，不过滤会淹没时间线（§2.2）。
+// 注意 FILTER 占位符要留在这里：即使 --source 里没有 file，只要有人在用 file 就过滤；
+// 但过滤条件本身必须无条件成立 —— 所以 FILE 谓词放在 FILTER 之后。
+tracepoint:syscalls:sys_enter_openat
+/@@FILTER@@ && @@SRC_FILE@@ && (@@FILE_PRED@@)/
+{
+    // 坑 #11：sys_enter_openat 的 tracepoint 字段名是 `dfd`（不是 dirfd）。
+    // 本机 /sys/kernel/tracing/events/syscalls/sys_enter_openat/format 里是
+    // `field:int dfd`。写 `args->dirfd` 会在加载期直接编译失败，整个采集器死掉 ——
+    // 而如果没人看 stderr，时间线会安静地一条不剩。
+    @o_path[tid] = str(args->filename, 200);
+    @o_flags[tid] = args->flags;
+    @o_dirfd[tid] = args->dfd;
+    @o_has[tid] = 1;
+}
+
+tracepoint:syscalls:sys_exit_openat
+/@o_has[tid] == 1/
+{
+    printf("OPEN|%llu|%d|%d|%d|%llu|%x|%d|%d|%s\n",
+           nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+           @o_flags[tid], @o_dirfd[tid], args->ret, @o_path[tid]);
+    delete(@o_path[tid]); delete(@o_flags[tid]);
+    delete(@o_dirfd[tid]); delete(@o_has[tid]);
+}
+
+// ===========================================================================
+// GROUP: net —— 连接与数据报（DESIGN.md §2.2 Group C）
+// ===========================================================================
+tracepoint:syscalls:sys_enter_connect
+/@@FILTER@@ && @@SRC_NET@@/
+{
+    @c_fam[tid] = args->uservaddr->sa_family;
+    @c_fd[tid] = args->fd;
+    if (args->uservaddr->sa_family == 2) {
+        // AF_INET：s_addr 是主机序整数，ntop 直接出点分十进制。
+        // 坑 #12：**不能**再用一个同名的 `@c_addr` 去接 v6 或空串。bpftrace 的 map
+        // 值类型由全部赋值点共同推断，ntop(sockaddr_in) 给出 inet 类型，再赋
+        // string[1]（空串）就会 "Type mismatch for @c_addr"。v4/v6 分开两个 map，
+        // 非 IP 族走 printf 里的字面量。
+        @c_a4[tid] = ntop(((struct sockaddr_in*)args->uservaddr)->sin_addr.s_addr);
+        // 坑 #5：sin_port 读出来是网络序被当主机序解释，必须 bswap。
+        @c_port[tid] = bswap(((struct sockaddr_in*)args->uservaddr)->sin_port);
+    } else if (args->uservaddr->sa_family == 10) {
+        // AF_INET6：v0.20.2 无 sprintf（坑 #10），用 ntop 吃 u6_addr8 字节数组。
+        @c_a6[tid] = ntop(((struct sockaddr_in6*)args->uservaddr)->sin6_addr.in6_u.u6_addr8);
+        @c_port[tid] = bswap(((struct sockaddr_in6*)args->uservaddr)->sin6_port);
+    } else {
+        // AF_UNIX 等没有"地址"概念，只记 family（§2.2）。
+        @c_port[tid] = 0;
+    }
+    @c_has[tid] = 1;
+}
+
+tracepoint:syscalls:sys_exit_connect
+/@c_has[tid] == 1/
+{
+    // 三个分支的 printf 形状完全一致，只有地址来源不同 ——
+    // 这是为了绕开 map 值类型必须唯一这个约束（坑 #12），不是逻辑差异。
+    if (@c_fam[tid] == 2) {
+        printf("CONN|%llu|%d|%d|%d|%llu|%d|%d|%d|%d|%s\n",
+               nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+               @c_fd[tid], @c_fam[tid], @c_port[tid], args->ret, @c_a4[tid]);
+    } else if (@c_fam[tid] == 10) {
+        printf("CONN|%llu|%d|%d|%d|%llu|%d|%d|%d|%d|%s\n",
+               nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+               @c_fd[tid], @c_fam[tid], @c_port[tid], args->ret, @c_a6[tid]);
+    } else {
+        printf("CONN|%llu|%d|%d|%d|%llu|%d|%d|%d|%d|%s\n",
+               nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+               @c_fd[tid], @c_fam[tid], @c_port[tid], args->ret, "non-IP family");
+    }
+    delete(@c_fam[tid]); delete(@c_fd[tid]);
+    delete(@c_a4[tid]); delete(@c_a6[tid]);
+    delete(@c_port[tid]); delete(@c_has[tid]);
+}
+
+// §5.4 #5：sendto 覆盖率不确定（现代 HTTP 客户端多用 sendmsg/write），
+// 预期在真实 agent 流量里近乎为空。采集它，但不指望它。
+tracepoint:syscalls:sys_enter_sendto
+/@@FILTER@@ && @@SRC_NET@@/
+{
+    printf("SEND|%llu|%d|%d|%d|%llu|%d|%d\n",
+           nsecs, pid, tid, curtask->real_parent->pid, cgroup,
+           args->fd, args->len);
+}
+
+// ===========================================================================
+// 心跳 + stash 定期清理（DESIGN.md §2.2 "stash 泄漏"）
+// ===========================================================================
+// 进程在 enter 与 exit 之间被杀时 stash 项不会被清除 → 定期清理。
+// 代价：极少数跨越 30s 的 syscall 会丢配对（§5.2 #4）。
+interval:s:30
+{
+    clear(@o_path); clear(@o_flags); clear(@o_dirfd); clear(@o_has);
+    clear(@c_fam); clear(@c_fd); clear(@c_a4); clear(@c_a6); clear(@c_port); clear(@c_has);
+    clear(@argv_fn); clear(@argv_has);
+@@ARGV_DELETE@@
+    printf("TICK|%llu\n", nsecs);
+}
+
+// 优雅退出时不 dump map（否则 @in_tree 会吐出成百上千行噪声）。
+// Rust 端也会忽略非协议行，这里是双保险。
+END
+{
+    clear(@in_tree);
+    clear(@o_path); clear(@o_flags); clear(@o_dirfd); clear(@o_has);
+    clear(@c_fam); clear(@c_fd); clear(@c_a4); clear(@c_a6); clear(@c_port); clear(@c_has);
+    clear(@argv_fn); clear(@argv_has);
+@@ARGV_DELETE@@
+}

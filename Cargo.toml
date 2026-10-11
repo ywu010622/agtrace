@@ -1,0 +1,15 @@
+[package]
+name = "agtrace"
+version = "0.4.0"
+edition = "2024"
+authors = ["Yuhang Wu"]
+license = "MIT"
+description = "strace for AI agents: a live timeline joining what the agent claims with what the kernel actually did"
+repository = "https://github.com/ywu010622/agtrace"
+keywords = ["agent", "tracing", "ebpf", "debugging", "llm"]
+
+[dependencies]
+libc = "0.2.190"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+toml = "1.1.8"

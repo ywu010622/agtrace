@@ -1,0 +1,4 @@
+# agtrace 的排版约定：120 列（DESIGN.md 的"120-col"质量门槛）。
+# 显式声明，避免不同的 rustfmt 默认值（100）在无意中把整棵树重排。
+max_width = 120
+edition = "2024"
