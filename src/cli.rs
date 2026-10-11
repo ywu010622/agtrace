@@ -156,7 +156,7 @@ Target (give at least one; -p and -C are mutually exclusive):
 
 Behavior:
   -f, --follow             live tail (without it, stop at EOF — for offline fixtures)
-      --adapter <NAME>     claude-code | openshell            (default claude-code)
+      --adapter <NAME>     claude-code | openshell | jsonl  (default claude-code)
       --transcript <PATH>  explicit transcript file or directory
       --time-base <MODE>   fixture time anchor: now | wall | epoch   (default now)
       --source <LIST>      comma-separated: exec,file,net,agent      (default all)

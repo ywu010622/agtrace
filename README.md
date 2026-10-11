@@ -73,14 +73,43 @@ kernel events (bpftrace probes) ─────┘        execve / fork / exit /
 ```
 
 - **Collector**: a single bpftrace script (4 probe groups) compiled into the binary; filters by PID tree or cgroup — agtrace never traces system-wide.
-- **Adapters**: `claude-code` (default; transcript JSONL as a live feed), `openshell` (stub on the same event interface).
+- **Adapters**: `claude-code` (default; transcript JSONL as a live feed), `openshell` (stub on the same event interface), `jsonl` (generic: tails a file of agent events — one JSON object per line — so custom agents can plug in; see below).
 - **Derived views**: binding, failure attribution, retry detection, watchlist — computed from evidence, never asserted without it. A failed call with no kernel evidence is reported as `no-kernel-source`, not guessed at.
 
 See [DESIGN.md](DESIGN.md) for the full design (event model, clock discipline, evidence rules).
 
+## Custom agents (LangChain, LangGraph, ...)
+
+The kernel half (`-p`/`-C`) needs no adapter — it follows any process tree.
+To get the agent layer (tool calls, model I/O) for binding and failure
+attribution, emit events as JSONL and tail them with `--adapter jsonl`:
+
+```bash
+# 1. emit events from your agent (see examples/langchain_callback.py):
+from langchain_callback import AgtraceCallbackHandler
+handler = AgtraceCallbackHandler("/tmp/agtrace-events.jsonl")
+agent = create_react_agent(model, tools, callbacks=[handler])
+
+# 2. watch it live (PID = your agent process):
+sudo agtrace --adapter jsonl -S /tmp/agtrace-events.jsonl -p <pid> -f
+```
+
+One JSON object per line; `ts` is ISO8601 or epoch seconds (missing = read time):
+
+```json
+{"type": "prompt",      "text": "do X", "ts": "2026-10-11T20:00:00.123Z"}
+{"type": "tool.call",   "id": "call_1", "tool": "Bash", "command": "ls /tmp"}
+{"type": "tool.result", "id": "call_1", "status": "success", "output": "..."}
+{"type": "model.text",  "text": "I'll list /tmp"}
+```
+
+`id` correlates a call with its result (this is what `--failures-only` selects on).
+For `tool.call`, `command` carries the shell command so argv binding works; other
+tools correlate by time. Full schema: `src/adapter/jsonl.rs`.
+
 ## Status
 
-v0.4. Adapters: Claude Code (live). Single static Rust binary; `cargo test` green (174 tests) plus a `tests/real_cases.sh` regression suite replaying real captured sessions.
+v0.4.1. Adapters: Claude Code (live), generic jsonl (LangChain/LangGraph/any). Single static Rust binary; `cargo test` green (174 tests) plus a `tests/real_cases.sh` regression suite replaying real captured sessions.
 
 ## License
 

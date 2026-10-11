@@ -4,6 +4,7 @@
 //! 主循环用一个简单的多路复用轮询，adapter 不得阻塞超过 ~10ms。
 
 pub mod claude_code;
+pub mod jsonl;
 pub mod openshell;
 
 use crate::event::{Binding, Corr, Event, Kind, Layer, Payload, TruncNote};

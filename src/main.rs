@@ -258,9 +258,15 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 target_desc = format!("openshell fixture {}", file_basename(src));
                 adapters.push(Box::new(a));
             }
+            "jsonl" => {
+                let a = adapter::jsonl::JsonlAdapter::new(src, cli.tool_arg_max, cli.follow)
+                    .map_err(|e| e.to_string())?;
+                target_desc = format!("jsonl events {}", file_basename(src));
+                adapters.push(Box::new(a));
+            }
             other => {
                 return Err(format!(
-                    "unknown --adapter `{}` (available: claude-code | openshell)",
+                    "unknown --adapter `{}` (available: claude-code | openshell | jsonl)",
                     other
                 ));
             }

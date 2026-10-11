@@ -422,6 +422,14 @@ struct Capabilities {
 }
 ```
 
+**`jsonl` adapter (v0.4.1)**: a generic, framework-agnostic agent event source.
+Input is one JSON object per line (`type` / `ts` / `id` / type-specific fields;
+schema documented in `src/adapter/jsonl.rs`). `live: true` (tails the file),
+`needs_pid_binding: true`. Ships with `examples/langchain_callback.py`, a
+~60-line LangChain/LangGraph callback handler. Design rule: the adapter never
+invents agent semantics — unknown `type`s are counted and skipped, missing `ts`
+falls back to wall-clock-at-read and is noted on the event.
+
 **Why `poll` rather than an `async Stream`**: v0 does not pull in tokio. A simple `mio`/polling
 main loop suffices:
 ```
