@@ -12,6 +12,12 @@ use super::{
 use crate::event::{Binding, Event, Kind, Layer, corr_key};
 use std::io::Write;
 
+/// v0.6 失败段里注解行（血缘 / 对账 / 嗅探）的缩进。
+///
+/// 用 `  ` 而不是对齐到正文列：真正对齐需要把 `fit_fail` 的列预算也算进来，
+/// 而这几行是**注解**，视觉上"缩进去一档"就够了。`└─` 自己已经说明了从属关系。
+const INDENT: &str = "        ";
+
 /// 启动横幅的内容（§4.2 第一行）。
 pub struct Header {
     /// 例如 `pid 644607 (tree)` / `cgroup /sys/fs/cgroup/x` / `session 65a34ef2`
@@ -370,6 +376,36 @@ impl TextRenderer {
                 MAX_COLS,
             );
             s.push_str(&format!("{}\n", colorize(&self.opts, RED, &body)));
+
+            // v0.6 §14.1：血缘（产物从哪来、又到哪去）。
+            //
+            // 放在失败那一行的**下面**、缩进对齐到正文：它们是这条失败的注解，
+            // 不是另一条失败。行文里的证据等级（`produced by step N`、
+            // `userspace inference`）由 `lineage.rs` 生成，渲染层不加不减 ——
+            // 这一层一旦"顺手润色"，屏幕上就会出现比账里更硬的话。
+            for l in &f.lineage {
+                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, l))));
+            }
+            // v0.6 §14.2：其余几列对账。`!!` 的那一行已经在 `f.head` 里了，
+            // 这里补的是同一次结果里的**其它** claim（一行结果可以既说写了文件
+            // 又说下了 URL），它们不是失败，所以用暗色。
+            for c in &f.claims {
+                let line = c.render();
+                // 第一列已经是这一行的 `head`（`-> claim: ... !!`）—— 再打一遍
+                // 是同一句话说两次，而失败段的价值就在于每一行都值得读。
+                if line == f.head {
+                    continue;
+                }
+                s.push_str(&format!(
+                    "{}\n",
+                    colorize(&self.opts, if c.mismatch { RED } else { DIM }, &format!("{}{}", INDENT, line))
+                ));
+            }
+            // v0.6 §14.3：内容嗅探。**用户态启发式** —— 句子自己带着这句话
+            //（由 `lineage::sniff` 保证），这里只负责缩进。
+            for x in &f.sniff {
+                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, x))));
+            }
         }
         if !ev.kernel_available {
             // 段级限定语。逐行的 `head` 已经各自带了限定，这里再说一遍是为了让

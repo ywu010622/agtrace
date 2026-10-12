@@ -1,0 +1,10 @@
+EXEC|400|8100|8100|1|0|3|bash|/usr/bin/bash
+ARGV|400|8100|8100|0|bash
+ARGV|400|8100|8100|1|-c
+ARGV|400|8100|8100|2|curl -sL https://example.com/q3.pdf -o $DIR/work/q3.pdf
+CONN|450|8100|8100|1|0|3|2|443|0|93.184.216.34
+OPEN|500|8100|8100|1|0|241|4294967295|3|$DIR/work/q3.pdf
+EXEC|1300|8200|8200|1|0|3|bash|/usr/bin/bash
+ARGV|1300|8200|8200|0|bash
+ARGV|1300|8200|8200|1|-c
+ARGV|1300|8200|8200|2|display_pdf $DIR/work/q3.pdf

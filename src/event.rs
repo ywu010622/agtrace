@@ -195,6 +195,27 @@ pub enum Kind {
     /// 证据（见 fail.rs 的铁律注释）。
     #[serde(rename = "derived.fail")]
     DerivedFail,
+    /// v0.6 §14：**产物血缘**的一行 —— "这条调用的输入，是第几步产出的、那一步成没成"。
+    ///
+    /// 与 `DerivedFail` 一起出现（紧跟在那条 `XX` 后面），只在失败视图里产出：
+    /// 正常时间线上加这一行只会把时间线撑长，而它的全部价值都建立在
+    /// "有个下游调用正在为这个产物收拾残局"之上。
+    ///
+    /// 它是**用户态推断**，不是内核证据：依据是 transcript 里前后两次提到同一个
+    /// 绝对路径/URL。这一点写在行首的 `└─ ` 与 `notes` 里，`-v` 与 json 都能查到。
+    #[serde(rename = "derived.lineage")]
+    DerivedLineage,
+    /// v0.6 §14：**claim vs kernel** 的一行 —— transcript 说的事，和内核看到的事，
+    /// 并排放在一行里。
+    ///
+    /// 这是 v0.6 的楔子：`tool.result` 说"下载好了"，而内核里那条调用的子树**没有**
+    /// 任何一次写意图 open。两边都是**事实**，矛盾才是信息。
+    ///
+    /// 两列里，`claim:` 侧来自 transcript 文本（启发式），`kernel:` 侧来自内核事件
+    /// （实测）。不一致时行尾有 `!!`；一致时也照打 —— 只打不一致的话，读者无法
+    /// 区分"核对过、一致"和"根本没核对"。
+    #[serde(rename = "derived.claim")]
+    DerivedClaim,
 }
 
 impl Kind {
@@ -227,6 +248,8 @@ impl Kind {
             Kind::DerivedForkBurst => "derived.fork_burst",
             Kind::DerivedBind => "derived.bind",
             Kind::DerivedFail => "derived.fail",
+            Kind::DerivedLineage => "derived.lineage",
+            Kind::DerivedClaim => "derived.claim",
         }
     }
 
@@ -243,6 +266,8 @@ impl Kind {
             // `derived.fail` 去掉前缀只剩 `fail`，但它是 v0.4 唯一一条**默认刷红**的
             // 摘要行，短名直接写死，免得将来加前缀规则时把它改成别的词。
             Kind::DerivedFail => return "fail",
+            Kind::DerivedLineage => return "lineage",
+            Kind::DerivedClaim => return "claim",
             _ => {}
         }
         let s = self.as_str();
@@ -544,6 +569,11 @@ pub enum Payload {
     /// `head` 是**结果侧**说的（`exit 2` / `BEFORE exec: ...`），`deepest` 是
     /// **内核侧**说的（`openat /x ENOENT via /usr/bin/ls`）。两边都不许猜。
     Fail {
+        /// v0.6：这是本次会话的第几次 `tool.call`（从 1 数起，**全部**调用都数 ——
+        /// 包括成功的）。血缘链两头的步号就是它，所以两处必须是同一套编号：
+        /// 用户在屏幕上数到第 12 条 `tool.call`，`XX` 行上就该写着 12。
+        #[serde(default)]
+        step: u64,
         /// 工具名（`Bash`）。
         tool: String,
         /// 这次调用要跑的命令行。与 `Bind::cmd_preview` 一样可能被截断。
@@ -558,6 +588,29 @@ pub enum Payload {
         deepest: Option<String>,
         /// 挂在这条调用上的内核事件数（0 = 内核侧一条都没连上）。
         kernel_events: u64,
+    },
+    /// v0.6 §14：一条**产物血缘**行（`derived.lineage`）。正文就是给人读的那句话。
+    ///
+    /// 为什么正文是一个**已经格式化好的字符串**而不是几个字段：这条行是
+    /// `└─ input /tmp/report.pdf produced by step 3 fetch_pdf (ERRORED: 404)`
+    /// 这种"箭头 + 一句话"的形状，拆成字段后渲染层要把它重新拼一遍，而拼接规则
+    /// （哪个库、什么状态、截断到多少列）只属于渲染层。结构化的一半在
+    /// `corr.tool_use_id`（这条链属于哪次调用）和 `extra.failures[].lineage` 里。
+    Lineage {
+        text: String,
+    },
+    /// v0.6 §14：一条 **claim vs kernel** 行（`derived.claim`）。
+    ///
+    /// 两列**分开存**，不在这里拼 `|`：渲染层要按终端宽度决定各自的列宽
+    /// （并且两边都可能被截断，截断必须在渲染层统一做，否则 json 里的字段
+    /// 会是"已经被屏幕宽度裁过"的假值）。
+    Claim {
+        /// transcript 那一侧说的（`wrote /tmp/report.pdf`）。
+        claim: String,
+        /// 内核那一侧看到的（`no write open observed`）。
+        kernel: String,
+        /// 两边是否矛盾。`true` 时渲染行尾 `!!`。
+        mismatch: bool,
     },
 }
 
@@ -663,7 +716,11 @@ impl Event {
     /// agtrace 推出来的、不是内核直接说的"这件事保持单一含义，
     /// 而 `Kind` 字段承担区分两者（`-v` 与 `--output json` 里都在）。
     pub fn renders_as_derived(&self) -> bool {
-        self.is_collapse() || matches!(self.kind, Kind::DerivedBind | Kind::DerivedFail)
+        self.is_collapse()
+            || matches!(
+                self.kind,
+                Kind::DerivedBind | Kind::DerivedFail | Kind::DerivedLineage | Kind::DerivedClaim
+            )
     }
 }
 

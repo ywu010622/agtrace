@@ -1,0 +1,13 @@
+EXEC|400|7001|7001|1|0|3|bash|/usr/bin/bash
+ARGV|400|7001|7001|0|bash
+ARGV|400|7001|7001|1|-c
+ARGV|400|7001|7001|2|curl -sL https://example.com/loop.pdf -o $DIR/work/loop.pdf
+OPEN|500|7001|7001|1|0|241|4294967295|3|$DIR/work/loop.pdf
+EXEC|1100|7002|7002|1|0|3|bash|/usr/bin/bash
+ARGV|1100|7002|7002|0|bash
+ARGV|1100|7002|7002|1|-c
+ARGV|1100|7002|7002|2|curl -sL https://example.com/loop.pdf -o $DIR/work/loop.pdf
+EXEC|1800|7003|7003|1|0|3|bash|/usr/bin/bash
+ARGV|1800|7003|7003|0|bash
+ARGV|1800|7003|7003|1|-c
+ARGV|1800|7003|7003|2|curl -sL https://example.com/loop.pdf -o $DIR/work/loop.pdf

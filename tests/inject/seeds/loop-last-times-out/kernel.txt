@@ -1,0 +1,14 @@
+EXEC|400|6001|6001|1|0|3|bash|/usr/bin/bash
+ARGV|400|6001|6001|0|bash
+ARGV|400|6001|6001|1|-c
+ARGV|400|6001|6001|2|curl -sL https://example.com/loop.pdf -o $DIR/work/loop.pdf
+OPEN|500|6001|6001|1|0|241|4294967295|3|$DIR/work/loop.pdf
+EXEC|1100|6002|6002|1|0|3|bash|/usr/bin/bash
+ARGV|1100|6002|6002|0|bash
+ARGV|1100|6002|6002|1|-c
+ARGV|1100|6002|6002|2|curl -sL https://example.com/loop.pdf -o $DIR/work/loop.pdf
+OPEN|1200|6002|6002|1|0|241|4294967295|3|$DIR/work/loop.pdf
+EXEC|1800|6003|6003|1|0|3|bash|/usr/bin/bash
+ARGV|1800|6003|6003|0|bash
+ARGV|1800|6003|6003|1|-c
+ARGV|1800|6003|6003|2|curl -sL https://example.com/loop.pdf -o $DIR/work/loop.pdf

@@ -369,13 +369,39 @@ pub fn payload_line(ev: &Event, budget: usize) -> String {
         // 与 bind 行同样的取舍：`->` 之后的部分是**这一行存在的理由**，
         // 绝不能因为命令行太长而被截掉，所以命令从中间省略、尾部优先。
         Payload::Fail {
+            step,
             tool,
             cmd_preview,
             class,
             head,
             deepest,
             kernel_events,
-        } => fail_line(tool, cmd_preview, class, head, deepest.as_deref(), *kernel_events, budget),
+        } => fail_line(
+            *step,
+            tool,
+            cmd_preview,
+            class,
+            head,
+            deepest.as_deref(),
+            *kernel_events,
+            budget,
+        ),
+        // v0.6 §14.1：血缘行。行文自己带 `└─` 前缀（缩进 + 一个视觉上的"引自"），
+        // 正文由 `lineage.rs` 生成 —— 渲染层不重排它，因为那句话里的**每个词**
+        // 都在标注它的证据等级（`produced by step 3`、`(ERRORED: 404)`）。
+        Payload::Lineage { text } => format!("└─ {}", text),
+        // v0.6 §14.2：claim vs kernel 的其余几列。`!!` 由 `mismatch` 决定 ——
+        // 它与 §8 视图行的 `!!` 是同一个记号、同一个含义（可疑，且我们有资格说）。
+        Payload::Claim {
+            claim,
+            kernel,
+            mismatch,
+        } => format!(
+            "claim: {} | kernel: {}{}",
+            claim,
+            kernel,
+            if *mismatch { " !!" } else { "" }
+        ),
     }
 }
 
@@ -385,6 +411,7 @@ pub fn payload_line(ev: &Event, budget: usize) -> String {
 /// 已经把类别说完了），再花一遍 120 列的预算等于把命令又挤掉一截。
 /// 参数保留是为了让调用点与 json 字段一一对应，读者不必猜哪个字段没被渲染。
 fn fail_line(
+    step: u64,
     tool: &str,
     cmd: &str,
     _class: &str,
@@ -393,7 +420,11 @@ fn fail_line(
     _kernel_events: u64,
     budget: usize,
 ) -> String {
-    let prefix = format!("tool.call {} \"", tool);
+    // v0.6：`XX` 行带上 transcript 里的步号。归因行的整个价值是"去第几步看"，
+    // 而排在它上面的那几十行里，`tool.call` 有十几次 —— 没有步号，读者还得回头数。
+    // 步号是**本条流里的出现次序**，与内核无关，所以它放在工具名后面、
+    // 命令前面：`tool.call Bash step 12 "curl …" -> …`。
+    let prefix = format!("tool.call {} step {} \"", tool, step);
     let deepest_seg = match deepest {
         Some(d) => format!(" (deepest: {})", d),
         None => String::new(),
@@ -446,16 +477,30 @@ fn fit_fail(prefix: &str, cmd: &str, head_seg: &str, deepest_seg: &str, budget: 
     /// 命令的地板：再挤也要留下这么多，否则这一行定位不到任何东西。
     const CMD_FLOOR: usize = 8;
 
+    // v0.6：` !!` 是"这条对不上账"的记号，**不能被截掉**。它天生长在结论的尾部，
+    // 而这一行是从右往左砍的 —— 差一列就能把结论从"对不上账"砍成"这条有点长"。
+    // 所以先把它摘下来、从预算里留出它的位置，渲染完再贴回行尾。
+    //
+    // 放在这里而不是调用点：时间线和 footer 都走这个函数，而 footer 的行首短一截
+    //（这也是"时间线上看不全的东西到 footer 里一定看得全"的兑现方式）—— 两处
+    // 各写一遍，迟早有一处会漏。claim 行的 `deepest` 恒为 `None`
+    //（见 `fail.rs::flush_claim_check`），所以贴回行尾不会跟别的后缀争位置。
+    let (head_seg, flag) = match head_seg.strip_suffix(" !!") {
+        Some(h) => (h, " !!"),
+        None => (head_seg, ""),
+    };
+    let budget = budget.saturating_sub(display_width(flag));
+
     let p = display_width(prefix);
     let h = display_width(head_seg);
     let d = display_width(deepest_seg);
     if p + h + d + CMD_PREFERRED <= budget {
         let c = budget - p - h - d;
-        return format!("{}{}{}{}", prefix, elide_right(cmd, c), head_seg, deepest_seg);
+        return format!("{}{}{}{}{}", prefix, elide_right(cmd, c), head_seg, deepest_seg, flag);
     }
     if p + h + d + CMD_FLOOR <= budget {
         let c = budget - p - h - d;
-        return format!("{}{}{}{}", prefix, elide_right(cmd, c), head_seg, deepest_seg);
+        return format!("{}{}{}{}{}", prefix, elide_right(cmd, c), head_seg, deepest_seg, flag);
     }
     // 命令已经到地板，还是塞不下：deepest 在行尾，先牺牲它 —— 但只在能留下
     // 一段**有用**的它时才牺牲（14 列以下连 `(deepest: ` 都放不下）。
@@ -463,15 +508,16 @@ fn fit_fail(prefix: &str, cmd: &str, head_seg: &str, deepest_seg: &str, budget: 
     if d > 0 && room > h + 14 {
         let dseg = elide_right(deepest_seg, room - h);
         if p + h + display_width(&dseg) + CMD_FLOOR <= budget {
-            return format!("{}{}{}{}", prefix, elide_right(cmd, CMD_FLOOR), head_seg, dseg);
+            return format!("{}{}{}{}{}", prefix, elide_right(cmd, CMD_FLOOR), head_seg, dseg, flag);
         }
     }
     // 最后只剩结论。
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         prefix,
         elide_right(cmd, CMD_FLOOR),
-        elide_right(head_seg, room)
+        elide_right(head_seg, room),
+        flag
     )
 }
 

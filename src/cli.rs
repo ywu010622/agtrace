@@ -96,6 +96,16 @@ pub struct Cli {
     /// 内核采集后端。默认 aya（进程内 eBPF），失败时**可见地**退回 bpftrace。
     pub collector: CollectorBackend,
 
+    // ---- v0.6：内核行离线回放 ----
+    /// `--kernel-lines <PATH>`：不 attach 任何东西，把一份**已经采到的**内核行
+    /// 协议文本当作内核侧喂进流水线。
+    ///
+    /// 与 `--no-collapse` / `--failures-only` 是同一类开关（选择数据从哪来、
+    /// 呈现什么），不改协议、不改任何一行格式。存在的原因是**可复现**：内核采集要
+    /// root，而"这条失败应该归因到哪一层"这种问题必须在没有权限的机器上也能被
+    /// 逐字复现（见 `tests/inject.rs`）。
+    pub kernel_lines: Option<String>,
+
     // ---- 调试 ----
     pub keep_script: bool,
 }
@@ -107,6 +117,7 @@ impl Default for Cli {
             cgroup: None,
             session: None,
             follow: false,
+            kernel_lines: None,
             adapter: "claude-code".into(),
             transcript: None,
             time_base: TimeBase::Now,
@@ -185,6 +196,12 @@ Usage:
 Target (give at least one; -p and -C are mutually exclusive):
   -p, --pid <PID>          follow this process and its descendants (like strace -f)
   -C, --cgroup <PATH>      follow every process in this cgroup (e.g. /sys/fs/cgroup/xxx)
+      --kernel-lines <PATH> replay a saved kernel line stream (aya/bpftrace stdout) as the
+                           kernel side, without attaching to anything. Offline only
+                           (mutually exclusive with -p/-C/-f). The file's `nsecs` come from
+                           the machine that captured it, so cross-layer ordering is only
+                           trustworthy for a same-boot capture; parsing, binding and
+                           attribution are byte-for-byte the live code paths.
   -S, --session <ID|PATH>  follow the agent layer (Claude Code session id or transcript path)
                            combine with -p/-C to get a merged timeline
 
@@ -366,6 +383,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "--no-collapse" => cli.no_collapse = true,
             "--no-bind" => cli.no_bind = true,
             "--failures-only" => cli.failures_only = true,
+            "--kernel-lines" => cli.kernel_lines = Some(take(&mut it, &name)?),
 
             "-v" | "--verbose" => cli.verbose = true,
             "--keep-script" => cli.keep_script = true,
@@ -392,6 +410,27 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
              agtrace never traces system-wide — an unfiltered openat would drown\n\
              the timeline within seconds."
             .into());
+    }
+    // ---- v0.6 回放校验 ----
+    if cli.kernel_lines.is_some() {
+        // 回放和实时内核目标互斥：两者都指向"内核侧"，同时给没有意义
+        // （-p 已经 attach 到真进程，再叠一份历史文件只会让时间线自相矛盾）。
+        if cli.pid.is_some() || cli.cgroup.is_some() {
+            return Err(
+                "--kernel-lines replays a saved capture; -p/--pid and -C/--cgroup attach to a live \
+                 kernel. Pick one kind of kernel source."
+                    .into(),
+            );
+        }
+        // 回放是离线动作：它的行是**一次性**读完的，而 -f 的语义是"还会再来"。
+        // 两者组合只会让用户以为自己在看实时数据。
+        if cli.follow {
+            return Err(
+                "--kernel-lines is an offline replay of a saved file; -f/--follow means \"more is \
+                 coming\". Drop -f, or capture live with -p/-C."
+                    .into(),
+            );
+        }
     }
     if cli.argv_max == 0 {
         return Err(

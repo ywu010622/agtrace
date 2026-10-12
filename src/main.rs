@@ -12,6 +12,7 @@ mod ebpf;
 mod event;
 mod exact;
 mod fail;
+mod lineage;
 mod merger;
 mod poll;
 mod redact;
@@ -24,7 +25,7 @@ use cli::CollectorBackend;
 use collector::Collector;
 use collector::KernelCollector;
 use collector::bpftrace::{SourceFilter, Target, scan_descendants};
-use event::Binding;
+use event::{Binding, Event, TsSource};
 use fail::{FailAttributor, FailCfg};
 use merger::Merger;
 use poll::PollOutcome;
@@ -106,7 +107,13 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     let mut vcfg = ViewsConfig {
         // 有 `-p`/`-C` 才有内核源。纯 `-S` 读 transcript 时，"内核里没有看到 X"
         // 只是因为**我们没在看内核** —— 那种推断必须整条关掉（见 views.rs 楔形部分）。
-        kernel_available: cli.pid.is_some() || cli.cgroup.is_some(),
+        //
+        // v0.6：`--kernel-lines` 也是内核源（一份真的采到的内核行）。楔形视图在
+        // 回放下仍然是惰性的 —— 它还要求 `corr.pid_binding` 是 exact/heuristic，
+        // 而回放没有活进程树，那一位永远是 None。这是**对的**：回放的内核行与
+        // 本机进程树之间没有证据链。v0.6 的 claim 核对走的是另一条门槛
+        //（argv 绑定，见 fail.rs），两者不冲突。
+        kernel_available: cli.pid.is_some() || cli.cgroup.is_some() || cli.kernel_lines.is_some(),
         gap_ms: cli.gap_ms,
         retry_window_ms: cli.retry_window_ms,
         enable_gap: !cli.no_views,
@@ -142,7 +149,13 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     let mut seed_pids: Vec<u32> = Vec::new();
     let mut target: Option<Target> = None;
 
-    if let Some(pid) = cli.pid {
+    if let Some(path) = &cli.kernel_lines {
+        // v0.6 离线回放：内核行来自**一份文件**，不是本机的内核。解析器是同一条
+        // （见 collector/replay.rs），所以事件流与实时采集逐字节同构。
+        let r = collector::replay::KernelReplay::open(path, cli.file_all, cli.redact)?;
+        target_desc = format!("replay {}", file_basename(path));
+        collector = Some(KernelCollector::Replay(Box::new(r)));
+    } else if let Some(pid) = cli.pid {
         // 先确认进程真的存在 —— 否则 bpftrace 会安静地 attach 到空集合上，
         // 用户看到的是一条空时间线，会误以为"这个进程什么也没干"。
         if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
@@ -220,13 +233,16 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         // 挂起一条失败后等多久，才允许说"内核里没有它的足迹"：取重排窗口 ——
         // 合并器保证的是"ts 比水位线早一个窗口以上的内核事件都已放出"（§13.5）。
         settle_ns: cli.merge_window_ms.saturating_mul(1_000_000),
+        // v0.6 §14.2 的第二个门槛（会话级绑定到底连没连上）要等 `bind` 算出来
+        // 才知道 —— 那就是**下面**几行的事，这里先留 false。
+        pid_linked: false,
     };
-    let mut failer = FailAttributor::new(fail_cfg);
-
     // 内核采集没有自然 EOF —— 不说清楚的话用户会以为它卡住了。
     // 折成两行是为了守住"默认输出不超过 120 列"这条：这条注记和事件行一样会落到
     // 用户的终端里，一个照 120 列摆的窗口不该被它顶出折行。
-    if collector.is_some() && !cli.follow {
+    //
+    // 回放**有**自然结尾（文件读完就是读完），所以这句对它不成立。
+    if collector.as_ref().is_some_and(|c| !c.is_replay()) && !cli.follow {
         let backend = if collector.as_ref().is_some_and(|c| c.is_aya()) {
             "aya"
         } else {
@@ -292,6 +308,13 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     // ---------------- pid 绑定（§3.5）----------------
     let bind = binding::resolve(cli.pid, bind_session_id.as_deref(), bind_cwd.as_deref(), None);
 
+    // v0.6 §14.2 的第二个门槛：会话级绑定到底连没连上。用 `bind.level` 而不是
+    // "用户给了 -p" —— 给了 -p 但 pid_binding=None 时，我们看的进程树和这个会话
+    // 之间没有证据链，"内核里没有这次写入"也就不成立。
+    let mut fail_cfg = fail_cfg;
+    fail_cfg.pid_linked = matches!(bind.level, Binding::Exact | Binding::Heuristic);
+    let mut failer = FailAttributor::new(fail_cfg);
+
     // ---------------- v0.3 argv 级绑定（§3.5 三级）----------------
     //
     // 位置：merger **之后**、折叠**之前**。三条理由：
@@ -353,6 +376,16 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 .into(),
         );
     }
+    if let Some(path) = &cli.kernel_lines {
+        // 这条注记必须出现在**输出**里（不是 stderr）：回放最容易的误读就是把
+        // "这份文件里没有那条 openat"读成"内核当时没有写"。
+        notes.push(format!(
+            "--kernel-lines {}: kernel events are replayed from a file, not captured live. \
+             A line missing from that file means the capture does not contain it — not that \
+             the kernel did nothing. `nsecs` comes from the machine that captured it.",
+            file_basename(path)
+        ));
+    }
     if cli.failures_only {
         // 剪枝模式下的 `--- N events` 和 `--- span` 描述的是**过滤后**剩下的行。
         // 不说这一句，读的人会把 "12 events" 当成整条会话的规模，
@@ -384,6 +417,85 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
 
     write_out(&mut out, cli, &text_renderer.header(&header))?;
 
+    // ---------------- v0.6 离线回放：两条流先抽干，再按时间序喂 ----------------
+    //
+    // **为什么不能走主循环的按源轮询**：一轮里会把**整份**内核文件喂完，于是所有
+    // 内核行排在所有 agent 行前面 —— 跨层时间序没了（回放的意义就是让两条流按
+    // 它们真实发生的先后交错），而且 binder 是在**一个批次内**匹配 argv 的，两条
+    // 流不交错时它的时间窗判定也就无从谈起。
+    //
+    // 所以回放模式下两个源都先抽干，按 `ts_ns` 归并（同 ts 内核在先：内核事件是
+    // "发生了什么"，agent 行是"事后怎么记载它"），再按时间序推进 merger。
+    // 时间戳是过去的（回放的就是历史），所以 `push_kernel` 里的 `flush_due` 会
+    // 立刻把它们按序放出，`push_agent` 也照旧立即输出 —— 推送顺序 = 输出顺序。
+    let replay_mode = cli.kernel_lines.is_some();
+    let mut replay_stats: Option<(collector::ParseStats, u64)> = None;
+    if replay_mode {
+        let mut kernel_evs: Vec<Event> = Vec::new();
+        if let Some(c) = collector.as_mut() {
+            loop {
+                let mut v = Vec::new();
+                match c.poll(&mut v) {
+                    Ok(PollOutcome::Eof) => break,
+                    Ok(_) => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+                let n = v.len();
+                kernel_evs.extend(v);
+                if n == 0 {
+                    break;
+                }
+            }
+            // §4.1 的 Rust 侧兜底过滤：回放和实时采集走同一条。
+            kernel_evs.retain(|e| sources.allows(e.kind));
+        }
+        let mut agent_evs: Vec<Event> = Vec::new();
+        for a in adapters.iter_mut() {
+            loop {
+                let mut v = Vec::new();
+                match a.poll(&mut v) {
+                    Ok(PollOutcome::Eof) => break,
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("adapter {} failed: {}", a.id(), e)),
+                }
+                let n = v.len();
+                for mut ev in v {
+                    if a.capabilities().needs_pid_binding {
+                        stamp_agent(&mut ev, &bind, cli);
+                    }
+                    agent_evs.push(ev);
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        // 归并。agent 行的时间戳是**墙钟**（`ts_src=Converted`），排序必须用换算后
+        // 的单调值 —— 拿墙钟和内核的 `nsecs` 比大小是两个不同的钟在比。
+        kernel_evs.sort_by_key(|e| (e.ts_ns, e.seq));
+        agent_evs.sort_by_key(|e| (merge_key(e, &merger.clock), e.ts_wall_ns));
+        let (mut ki, mut ai) = (0usize, 0usize);
+        while ki < kernel_evs.len() || ai < agent_evs.len() {
+            let take_kernel = match (kernel_evs.get(ki), agent_evs.get(ai)) {
+                (Some(k), Some(a)) => k.ts_ns <= merge_key(a, &merger.clock),
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_kernel {
+                let ev = kernel_evs[ki].clone();
+                ki += 1;
+                merger.push_kernel(ev);
+            } else {
+                let ev = agent_evs[ai].clone();
+                ai += 1;
+                merger.push_agent(ev);
+            }
+        }
+        // 回放的账：读了多少行、降级了几条，都进 `-v`（不静默）。
+        replay_stats = collector.as_ref().map(|c| (c.parse_stats().clone(), c.redacted_events()));
+    }
+
     // ---------------- 主循环 ----------------
     let start = Instant::now();
     let mut summary = Summary {
@@ -391,7 +503,8 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         session: session_desc.clone(),
         ..Default::default()
     };
-    let mut agent_eof: Vec<bool> = vec![false; adapters.len()];
+    // 回放模式下两个源在进循环之前就已经抽干了（见上面那段）。
+    let mut agent_eof: Vec<bool> = vec![replay_mode; adapters.len()];
     let mut total_out: u64 = 0;
     let mut truncated_by_limit = false;
     let mut collector_failed: Option<String> = None;
@@ -413,7 +526,8 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         }
 
         // --- 内核 ---
-        let mut kdone = collector.is_none();
+        let mut kdone = collector.is_none() || replay_mode;
+        if !replay_mode {
         if let Some(c) = collector.as_mut() {
             let mut evs = Vec::new();
             match c.poll(&mut evs) {
@@ -456,17 +570,12 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
             let stamp = a.capabilities().needs_pid_binding;
             for mut ev in evs {
                 if stamp {
-                    // 在这里盖章而不是在 adapter 里：绑定是 merger/main 层的知识。
-                    ev.corr.pid_binding = Some(bind.level);
-                    ev.corr.pid_root = cli.pid;
-                    // v0.3：每条 agent 行的归因等级先按会话级填上。
-                    // tool.call 级的证据由 exact.rs 在有匹配时**升级**为 exact
-                    // （那要有 exec 才知道），所以这里是"兜底"不是"结论"。
-                    ev.binding = bind.level;
+                    stamp_agent(&mut ev, &bind, cli);
                 }
                 merger.push_agent(ev);
             }
         }
+        } // !replay_mode：回放的两条流已在进循环前喂完
 
         merger.clock.maybe_resync();
         merger.flush_due();
@@ -615,6 +724,7 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         summary.last_wall = Some(w);
     }
     let attributed = summary.failures.iter().filter(|f| f.deepest.is_some()).count();
+    let ls = failer.lineage_stats();
 
     let extra = serde_json::json!({
         "late": merger.late_count,
@@ -670,10 +780,12 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 "bound_no_evidence": summary.failures.iter().filter(|f| f.class == fail::CLASS_BOUND_NO_EVIDENCE).count(),
                 "unbound": summary.failures.iter().filter(|f| f.class == fail::CLASS_UNBOUND).count(),
                 "no_kernel_source": summary.failures.iter().filter(|f| f.class == fail::CLASS_NO_KERNEL_SOURCE).count(),
+                "claim_mismatch": summary.failures.iter().filter(|f| f.class == fail::CLASS_CLAIM).count(),
             },
             "list": summary.failures.iter().map(|f| serde_json::json!({
                 "ts_wall_ns": f.ts_wall_ns,
                 "ts_ns": f.ts_ns,
+                "step": f.step,
                 "tool": f.tool,
                 "cmd": f.cmd,
                 "class": f.class,
@@ -682,7 +794,46 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 "kernel_events": f.kernel_events,
                 "detected_by": f.detected_by,
                 "tool_use_id": f.tool_use_id,
+                // v0.6：血缘与对账。两句都是**渲染好的**句子（与屏幕上逐字相同），
+                // 因为它们的措辞里带着证据等级（`produced by step N`、
+                // `userspace heuristic`），拆成字段反而会让下游把限定语丢掉。
+                "lineage": f.lineage,
+                "claims": f.claims.iter().map(|c| c.render()).collect::<Vec<_>>(),
+                "claim_mismatch": f.claims.iter().any(|c| c.mismatch),
+                "sniff": f.sniff,
             })).collect::<Vec<_>>(),
+        },
+        // v0.6 §14.1：产物血缘的账。`reused` 才是这个功能的规模 ——
+        // 它数的是"被不止一步提到过的产物"，而不是"有多少次工具调用"。
+        "lineage": {
+            "steps": ls.steps,
+            "artifacts": ls.artifacts,
+            "mentions": ls.mentions,
+            "reused": ls.reused,
+        },
+        // v0.6 §14.2：claim 对账的账。
+        //
+        // **`checked` 与 `unverified` 必须分开报**：屏幕上没有 `!!` 既可能是
+        // "核对了、对得上"，也可能是"我们根本没资格核对"。合成一个数就等于
+        // 把这两种情况混成一句"一切正常"。
+        "claims": {
+            "seen": failer.claims_seen,
+            "checked": failer.claims_checked,
+            "unverified": failer.claims_unverified,
+            "mismatched": failer.claims_mismatched,
+        },
+        // v0.6 §14.4：离线回放的来料账。回放必须**自报家门**（这份文件里有多少行、
+        // 有几行没认出来），否则"内核里没有那条写"会被读成内核事实。
+        "replay": match &replay_stats {
+            Some((st, redacted)) => serde_json::json!({
+                "lines_total": st.lines_total,
+                "lines_unknown_tag": st.lines_unknown_tag,
+                "lines_malformed": st.lines_malformed,
+                "lines_non_protocol": st.lines_non_protocol,
+                "argv_orphans": st.argv_orphans,
+                "redacted_events": redacted,
+            }),
+            None => serde_json::Value::Null,
         },
         "clock_offset_ns": merger.clock.offset().to_string(),
     });
@@ -694,7 +845,18 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     let _ = out.write_all(tail_text.as_bytes());
 
     if cli.verbose {
-        print_diagnostics(cli, &summary, &merger, collector.as_ref(), &adapters, &bind, cs, bs);
+        print_diagnostics(
+            cli,
+            &summary,
+            &merger,
+            collector.as_ref(),
+            &adapters,
+            &bind,
+            cs,
+            bs,
+            &failer,
+            ls,
+        );
     }
 
     if truncated_by_limit {
@@ -709,6 +871,37 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
 
     let _ = out.flush();
     Ok(())
+}
+
+/// 归并用的时间键。
+///
+/// agent 行的时间戳是**墙钟**（`ts_src = Converted`，`ts_ns` 还是 0 —— 它由 merger
+/// 换算后填入）。拿墙钟直接和内核的 `nsecs` 比大小，是两个不同的钟在比大小；
+/// 这里用 merger 的同一份 offset 先换算成单调时间，回放的两条流才落在同一根轴上。
+fn merge_key(ev: &Event, clock: &merger::Clock) -> u64 {
+    if ev.ts_src == TsSource::Converted {
+        clock.mono_from_wall(ev.ts_wall_ns)
+    } else {
+        ev.ts_ns
+    }
+}
+
+/// agent 行的会话级盖章。
+///
+/// 两个调用点（实时轮询、v0.6 回放的预抽干）共用这一份：盖章规则只写一遍，
+/// 否则"回放里那条 `tool.result` 为什么没带上 pid_binding"会成为一个只能靠
+/// 对比两份代码才能回答的问题。
+///
+/// 只有声明 `needs_pid_binding` 的 adapter 才盖章 —— 给一个与进程树无关的
+/// fixture 盖上绑定标记，等于凭空制造一个不存在的关联。
+fn stamp_agent(ev: &mut Event, bind: &binding::BindingResult, cli: &Cli) {
+    // 在这里盖章而不是在 adapter 里：绑定是 merger/main 层的知识。
+    ev.corr.pid_binding = Some(bind.level);
+    ev.corr.pid_root = cli.pid;
+    // v0.3：每条 agent 行的归因等级先按会话级填上。
+    // tool.call 级的证据由 exact.rs 在有匹配时**升级**为 exact
+    // （那要有 exec 才知道），所以这里是"兜底"不是"结论"。
+    ev.binding = bind.level;
 }
 
 /// 剪枝模式下把时间原点钉在**会话起点**上（§13.4）。
@@ -753,6 +946,8 @@ fn print_diagnostics(
     bind: &binding::BindingResult,
     cs: collapse::CollapseStats,
     bs: exact::BindStats,
+    failer: &FailAttributor,
+    ls: lineage::LineageStats,
 ) {
     // 这一节**不套** §3 的 120 列上限：它是给人 grep 的 key=value 转储，
     // 截断它等于把 `-v` 存在的理由截掉。上限管的是时间线（横幅 / 事件行 / 统计行），
@@ -848,6 +1043,27 @@ fn print_diagnostics(
             skipped
         );
     }
+    // v0.6 §14.1 的账目。`reused` 才是这个功能的规模：它数的是"被不止一步提到过的
+    // 产物"，而不是"有多少次工具调用"。血缘只在失败视图里露面，所以屏幕上看到的
+    // 行数说明不了底下的表有多大 —— 这张表的大小只能在这里读。
+    eprintln!(
+        "  lineage (§14.1): steps {}; artifacts {}; mentions {}; reused {} \
+         (reused = referenced by more than one step)",
+        ls.steps, ls.artifacts, ls.mentions, ls.reused
+    );
+    // v0.6 §14.2 的账目。**`checked` 和 `unverified` 必须分开报**：屏幕上一个 `!!`
+    // 都没有，既可能是"核对了、对得上"，也可能是"我们根本没资格核对"（没有内核源 /
+    // 调用落在观测窗口之外）。合成一个数就等于把后者说成"一切正常"。
+    // `matched` 是算出来的（checked - mismatched），不单独存：它不是独立事实。
+    eprintln!(
+        "  claims (§14.2): seen {}; checked {} (matched {} / mismatched {}); unverified {} \
+         (unverified = never compared against the kernel, not \"verified ok\")",
+        failer.claims_seen,
+        failer.claims_checked,
+        failer.claims_checked.saturating_sub(failer.claims_mismatched),
+        failer.claims_mismatched,
+        failer.claims_unverified
+    );
     if let Some(c) = collector {
         let s = c.parse_stats();
         let id = Collector::id(c);

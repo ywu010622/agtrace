@@ -1,0 +1,6 @@
+EXEC|400|4242|4242|1|0|3|bash|/usr/bin/bash
+ARGV|400|4242|4242|0|bash
+ARGV|400|4242|4242|1|-c
+ARGV|400|4242|4242|2|curl -sL https://example.com/q3/report.pdf -o $DIR/work/report.pdf
+CONN|450|4242|4242|1|0|3|2|443|0|93.184.216.34
+OPEN|500|4242|4242|1|0|0|4294967295|3|$DIR/work/report.pdf

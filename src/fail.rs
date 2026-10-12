@@ -60,6 +60,7 @@
 //! 照旧立即输出，agent 层永远不阻塞时间线（merger §2.4）。
 
 use crate::event::{Binding, Event, Kind, Layer, Payload, errno_label, one_line};
+use crate::lineage::{self, ClaimVsKernel, Facts, Lineage};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 一个进程里同时挂着的未定论调用数上限。病态输入（几千条 tool.call 而一条 result
@@ -79,6 +80,13 @@ pub const CLASS_KERNEL: &str = "kernel";
 pub const CLASS_BOUND_NO_EVIDENCE: &str = "bound-no-evidence";
 pub const CLASS_UNBOUND: &str = "unbound";
 pub const CLASS_NO_KERNEL_SOURCE: &str = "no-kernel-source";
+/// v0.6：transcript 说它成功了，内核说没有这回事（§14.2 的楔子）。
+///
+/// 它和上面四类的区别是**方向**：四类是"这次调用为什么失败"，这一类是
+/// "这次调用根本没失败 —— 失败的是它的自述"。所以它挂在一条 `ok` 的结果上。
+/// 因此它只可能由 [`lineage::evaluate`] 的门槛通过时产出：没有内核源、
+/// 或者这条调用没被连上，这条结论**不成立**，那个调用会安静地什么也不产出。
+pub const CLASS_CLAIM: &str = "claim-mismatch";
 
 /// 结论是在什么条件下下的。进 `XX` 行的 notes（不进 payload）—— 它解释的是
 /// "我们凭什么现在说这句话"，是审计信息，不是渲染素材。
@@ -100,6 +108,14 @@ pub struct FailCfg {
     /// 内核事件都已放出"，所以水位线越过 `结果 ts + 这个值` 之后，再说"内核里
     /// 没有这条调用的足迹"才不是抢答。见文件头的"什么时候下结论"。
     pub settle_ns: u64,
+    /// v0.6 §14.2 的第二个门槛：会话级 pid 绑定是不是 exact/heuristic。
+    ///
+    /// 有些调用挂不上任何内核事件（binder 没匹配上），但它仍然落在我们看着的
+    /// 那棵进程树里。这种时候"内核里没有这次写入"这句话是**成立的** ——
+    /// 前提是我们真的看着它（本字段），而且它在我们看着的时间段里（见
+    /// [`lineage::Facts::in_window`]）。没有这一位，claim 核对在 `-p` 模式下
+    /// 会退化成只认 argv 绑定成功的调用。
+    pub pid_linked: bool,
 }
 
 impl Default for FailCfg {
@@ -108,6 +124,7 @@ impl Default for FailCfg {
             only: false,
             kernel_available: false,
             settle_ns: 0,
+            pid_linked: false,
         }
     }
 }
@@ -134,6 +151,25 @@ pub struct Failure {
     pub tool_use_id: Option<String>,
     /// 挂在这条调用上的内核事件数（0 = 内核侧一条都没连上）。
     pub kernel_events: u64,
+    /// 这是 transcript 里的第几次 `tool.call`（v0.6 血缘用的步号）。
+    ///
+    /// **只用于引用**（`└─ input X produced by step 3 fetch_pdf`），不是身份：
+    /// 它是本条流里 `tool.call` 的出现次序，与 adapter 有没有 `tool_use_id` 无关，
+    /// 也与内核事件无关。
+    pub step: u64,
+    /// 血缘行（v0.6 §14.1）。空 = 这条链上没有可说的引用关系。
+    ///
+    /// 每行都是**用户态推断**：依据是"另一条 `tool.call` 提到过同一个字符串"。
+    /// 行文里带着 `produced by step N`，而不是"这个文件是第 N 步写的"。
+    pub lineage: Vec<String>,
+    /// claim vs kernel 的并排对账行（v0.6 §14.2）。空 = 没有可核对的 claim，
+    /// 或者核对门槛不满足（两者在 `-v` 的计数里分开报）。
+    ///
+    /// 第一行如果是 `mismatch`，它就是这条失败记录的 `head`（进 `XX` 行）。
+    pub claims: Vec<ClaimVsKernel>,
+    /// 内容嗅探结论（v0.6 §14.3）。**用户态启发式，不是内核证据** ——
+    /// 句子里必须带 `userspace heuristic` 这几个字（由 [`lineage::sniff`] 保证）。
+    pub sniff: Vec<String>,
 }
 
 /// 一条未定论的 `tool.call`。
@@ -147,6 +183,8 @@ struct Call {
     cmd: String,
     ts_ns: u64,
     resolved: bool,
+    /// transcript 里的第几次 `tool.call`（见 [`Failure::step`]）。
+    step: u64,
 }
 
 /// 一条**已判定失败、但还不到下结论的时候**的调用（见文件头"什么时候下结论"）。
@@ -161,6 +199,19 @@ struct Pending {
     text: String,
     detected_by: String,
     call: Call,
+    kind: PendingKind,
+}
+
+/// 挂起的是哪种结论。两者的等待条件一样（证据到齐 / 水位线 / 流尾），
+/// 但放出来的东西完全不同：一个说"它失败了"，另一个说"它说自己成功了，
+/// 内核不认"。分开建模而不是塞进一个 `Option`，是为了让"成功调用也会挂起"
+/// 这件事在类型上看得见。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    /// 结果说这次调用失败了（v0.4 的四层归因）。
+    Fail,
+    /// 结果说成功了，但 transcript 里的话可以被内核核对（v0.6 §14.2）。
+    Claim,
 }
 
 /// 一条调用挂住的内核证据。全部**有界**（每类留最近 `MAX_CANDIDATES` 条）。
@@ -184,6 +235,12 @@ struct Evidence {
     argv_tokens: HashSet<String>,
     /// 挂在这条调用上的内核事件数（含折叠行）。
     kernel_events: u64,
+    /// v0.6 §14.2：这条调用子树里的写-open / 连接对端 / exec，供 claim 对账。
+    ///
+    /// 放在 `Evidence` 里而不是另开一张表：它的生命周期与 `Evidence` **逐字相同**
+    /// （同样的插入点、同样的移除点：结论落定那一刻）。多一张表就多一份
+    /// "什么时候删"的重复答案，而那种重复一定会漂移。
+    kb: lineage::KernelFacts,
 }
 
 impl Evidence {
@@ -240,10 +297,16 @@ enum Resolution {
     /// （带 `tool_use_id` 时是那个 id，不带时是合成的 `#<序号>`）。
     /// 让调用点去猜这个键，就等于把"怎么算键"这件事写了两遍。
     Opened(String),
-    /// 结果说这次调用成功了。
+    /// 结果说这次调用成功了，而且它没有任何可核对的 claim —— 无事发生。
     Clean,
     /// 结果说这次调用失败了 —— 但**还没有归因行**：结论要等内核证据到齐（文件头）。
     Failed,
+    /// 结果说成功了，但文本里有能被内核核对的话（v0.6 §14.2）。
+    ///
+    /// 它**不是**失败 —— 但它同样不能当场下结论：`ok` 是不是真的，要看这条调用
+    /// 挂住的内核事件里有没有那笔写入。所以它走和 `Failed` 一样的等待路径，
+    /// 只是放出来的东西不同（对上了就什么都放不出）。
+    ClaimPending,
 }
 
 pub struct FailAttributor {
@@ -270,6 +333,18 @@ pub struct FailAttributor {
     pub failures: Vec<Failure>,
     /// 本 run 实际收到过内核事件吗（用于 `-v` 与 json 的诚实说明）。
     pub kernel_events_seen: u64,
+    /// v0.6 §14.1：全会话的产物提到表。**不随调用结束而释放** ——
+    /// 血缘是"第 12 步引用第 3 步的产物"，第 3 步的账必须还在。
+    /// 每条 `tool.call` 一项（几个产物字符串），量级小于 transcript 本身。
+    lineage: Lineage,
+    /// 第一条内核事件的墙钟 —— 观测窗口的左沿（见 [`lineage::Facts::in_window`]）。
+    kernel_first_wall: Option<u64>,
+    /// v0.6 §14.2 的计数。**必须先分清"核对过没问题"和"没资格核对"**，
+    /// 否则"没有 `!!`"会被读成"一切正常"。
+    pub claims_seen: u64,
+    pub claims_checked: u64,
+    pub claims_unverified: u64,
+    pub claims_mismatched: u64,
 }
 
 impl FailAttributor {
@@ -287,7 +362,18 @@ impl FailAttributor {
             end_wall: None,
             failures: Vec::new(),
             kernel_events_seen: 0,
+            lineage: Lineage::new(),
+            kernel_first_wall: None,
+            claims_seen: 0,
+            claims_checked: 0,
+            claims_unverified: 0,
+            claims_mismatched: 0,
         }
+    }
+
+    /// v0.6 血缘的账（进 `-v` 与 `--output json`）。
+    pub fn lineage_stats(&self) -> lineage::LineageStats {
+        self.lineage.stats()
     }
 
     /// 会话起点 / 终点（全流的最小、最大墙钟）。
@@ -313,7 +399,8 @@ impl FailAttributor {
             let belongs = self.key_for_event(&ev);
             self.note_origin(&ev);
             let res = self.observe(&ev);
-            let failed = matches!(res, Resolution::Failed);
+            // 挂起的两条路（失败归因、claim 核对）都要问一句"现在能下结论了吗"。
+            let failed = matches!(res, Resolution::Failed | Resolution::ClaimPending);
             if self.cfg.only {
                 self.route_filtered(ev, belongs, res);
             } else {
@@ -346,9 +433,29 @@ impl FailAttributor {
         self.flush_failure(p, why, out);
     }
 
-    /// 这条挂起的失败，答案还会变吗。
+    /// 这条挂起的结论，答案还会变吗。
+    ///
+    /// 这条挂起的结论，答案还会变吗。
+    ///
+    /// 真失败：内核里已经有挂到这条调用上的东西了，病因就不会再变 —— 可以立刻说。
+    ///
+    /// **对账（claim）不能照抄这一条**，这是 v0.6 在真实会话里踩到的坑：claim 的
+    /// 否定结论（`no write open observed`）说的不是"这条调用身上发生了什么"，而是
+    /// "整段内核流里都没有"。而**写经常发生在结果之后** —— curl 先收完响应头、
+    /// 再落盘，实测落盘比 `tool.result` 晚 20~60ms；exec/fork 却早就在结果之前挂上
+    /// 了。于是"已有内核事件挂上"在这条路上恰恰是**最不能下结论**的时刻：它会把
+    /// 每一次真写都喊成"没写"（真机复现见 V06_RUN.log 的 acceptance #4）。
+    /// 所以它必须等水印走过 `结果时刻 + settle 窗口`。
     fn decided_now(&self, p: &Pending) -> bool {
-        !self.cfg.kernel_available || self.ev.get(&p.key).is_some_and(|e| e.kernel_events > 0)
+        if !self.cfg.kernel_available {
+            return true;
+        }
+        match p.kind {
+            PendingKind::Fail => self.ev.get(&p.key).is_some_and(|e| e.kernel_events > 0),
+            PendingKind::Claim => {
+                self.kernel_watermark > p.src.ts_wall_ns.saturating_add(self.cfg.settle_ns)
+            }
+        }
     }
 
     /// 流结束。这里做两件事：
@@ -359,7 +466,29 @@ impl FailAttributor {
         let mut out = Vec::new();
         self.settle(true, &mut out);
         self.chains.clear();
+        self.refresh_lineage();
         out
+    }
+
+    /// v0.6 §14.1：把血缘的**完整**答案补进失败账。
+    ///
+    /// 为什么非要在流尾补一次：时间线上那条 `XX` 行是在证据到齐那一刻放出的
+    /// （§13.5），而"后面还有哪一步用了这个产物"当时**还没发生**。正向的血缘
+    ///（`output X referenced later by step 12 display_pdf`）只有整个会话都读完了
+    /// 才谈得上。失败账（footer 的 `--- failures` 与 json 的 `extra.failures`）
+    /// 本来就是回顾性的，所以它在流尾补齐 —— 时间线上已经渲染过的行一个字节
+    /// 都不动（那是"当时知道什么"的忠实记录）。
+    fn refresh_lineage(&mut self) {
+        for f in self.failures.iter_mut() {
+            let Some(key) = self.lineage.key_of_step(f.step).map(|s| s.to_string()) else {
+                continue;
+            };
+            for l in self.lineage.chain(&key) {
+                if !f.lineage.contains(&l) {
+                    f.lineage.push(l);
+                }
+            }
+        }
     }
 
     /// 批次末尾的定夺：能下结论的挂起失败在这里放出归因行。
@@ -374,7 +503,10 @@ impl FailAttributor {
             let (ready, why) = {
                 let p = &self.pending[i];
                 let linked = self.ev.get(&p.key).map(|e| e.kernel_events).unwrap_or(0);
-                if linked > 0 {
+                // 真失败：内核侧一挂上东西，病因就在手里了。
+                // 对账要等水印 —— 理由见 [`FailAttributor::decided_now`]。
+                let linked_is_enough = linked > 0 && p.kind == PendingKind::Fail;
+                if linked_is_enough {
                     (true, SETTLE_LINKED)
                 } else if !self.cfg.kernel_available {
                     (true, SETTLE_NO_SOURCE)
@@ -397,8 +529,17 @@ impl FailAttributor {
 
     /// 下结论：算出归因行，`--failures-only` 下顺带把整条链放出去。
     fn flush_failure(&mut self, p: Pending, why: &str, out: &mut Vec<Event>) {
+        match p.kind {
+            PendingKind::Fail => self.flush_failed_call(p, why, out),
+            PendingKind::Claim => self.flush_claim_check(p, why, out),
+        }
+    }
+
+    /// 一条真失败（结果自己说失败了）的归因。
+    fn flush_failed_call(&mut self, p: Pending, why: &str, out: &mut Vec<Event>) {
         let evidence = self.ev.remove(&p.key).unwrap_or_default();
-        let f = self.build_failure(&p.src, &p.call, &p.text, p.detected_by, &evidence);
+        let mut f = self.build_failure(&p.src, &p.call, &p.text, p.detected_by, &evidence);
+        self.attach_lineage(&p.key, &mut f);
         let row = fail_event(&p.src, &p.call, &f, why);
         self.failures.push(f);
         // 定论之后这条调用不再收内核行 —— 归因行已经写死了它的结论。
@@ -409,6 +550,126 @@ impl FailAttributor {
             }
         }
         out.push(row);
+    }
+
+    /// 一条 `ok` 结果的对账（v0.6 §14.2）。
+    ///
+    /// 三种出口，必须分清：
+    ///
+    /// 1. **对上了**（或门槛不满足）—— **一行都不产出**。这里是有意的：把
+    ///    "核对通过"也打出来，等于给每一次成功调用都加一行噪音，而失败视图的
+    ///    全部价值就在于"屏幕上出现的每一行都值得看"。核实过的条数进 `-v` 的计数。
+    /// 2. **对不上** —— 这条调用被**提升成一条失败记录**（class
+    ///    [`CLASS_CLAIM`]），走和真失败完全相同的收尾路径：进 `--failures-only`
+    ///    的链、进 footer 的 `--- failures`、进 json 的 `extra.failures`。
+    ///    不新开一条"警告"通道是刻意的 —— 下游要过滤的东西越少越好。
+    /// 3. **门槛不满足** —— 只记数（`claims_unverified`），什么都不说。
+    ///    我们没资格核对的东西，绝不说成"没问题"。
+    fn flush_claim_check(&mut self, p: Pending, why: &str, out: &mut Vec<Event>) {
+        let evidence = self.ev.remove(&p.key).unwrap_or_default();
+        let facts = self.facts_for(&p.key, &p.call, &evidence);
+        let claims = self.lineage.claims_of(&p.key);
+        self.claims_seen += claims.len() as u64;
+        let rows = lineage::evaluate(&claims, &facts);
+        if rows.is_empty() {
+            // 门槛没过：有 claim 但我们没资格核对。
+            if !claims.is_empty() {
+                self.claims_unverified += claims.len() as u64;
+            }
+            self.calls.remove(&p.key);
+            if self.cfg.only {
+                // `--failures-only`：这条链没有任何结论，整条丢掉。
+                self.chains.remove(&p.key);
+            }
+            return;
+        }
+        let mismatched = rows.iter().filter(|r| r.mismatch).count() as u64;
+        self.claims_checked += rows.len() as u64;
+        self.claims_mismatched += mismatched;
+        if mismatched == 0 {
+            // 核对通过：安静。这条链在 --failures-only 下不该留下来。
+            self.calls.remove(&p.key);
+            if self.cfg.only {
+                self.chains.remove(&p.key);
+            }
+            return;
+        }
+
+        // 对不上：把它当成一条失败来收尾。`head` 就是那两列 —— 这是 §14.2 的
+        // 全部意思：读者在 `XX` 行上同时看到 transcript 的自我陈述和内核的原话。
+        let first = rows.iter().find(|r| r.mismatch).expect("mismatched > 0");
+        // 先按"结果说它成功了"建一条记录（`head` 由下面覆盖），这样失败记录里
+        // 的每一个字段（工具、命令行、步号、ts、内核事件数）都来自同一条调用。
+        let mut f = self.build_failure(&p.src, &p.call, &p.text, String::new(), &evidence);
+        f.class = CLASS_CLAIM.to_string();
+        f.head = first.render();
+        f.detected_by = "text: claim not confirmed by the kernel events bound to this call".into();
+        // `deepest` 是"四层归因"里的概念（这次调用失败最深落在哪一层）。这条
+        // 调用根本没失败 —— 把它的子树里某次无关的失败 openat 摆进这一行，
+        // 读者会以为那是病因。内核侧的话已经在那两列里了。
+        f.deepest = None;
+        f.claims = rows;
+        self.attach_lineage(&p.key, &mut f);
+        let mut row = fail_event(&p.src, &p.call, &f, why);
+        // `XX` 行说的是"这一步有问题"，两列已经写在 head 里；多余的对账列
+        // （同一条结果里既说写了文件又说下了 URL）另起 `derived.claim` 行 ——
+        // 它们**不是**失败，只是同一笔对账的其余几列。
+        let extra: Vec<Event> = f
+            .claims
+            .iter()
+            .skip(1)
+            .map(|c| claim_event(&p.src, &p.call, c))
+            .collect();
+        let chain = if self.cfg.only { self.chains.remove(&p.key) } else { None };
+        self.failures.push(f);
+        self.calls.remove(&p.key);
+        row.notes.push(format!(
+            "claim vs kernel: {}; see the two columns in the head of this row",
+            if mismatched == 1 { "1 mismatch".to_string() } else { format!("{} mismatches", mismatched) }
+        ));
+        if let Some(mut chain) = chain {
+            out.append(&mut chain);
+        }
+        out.push(row);
+        out.extend(extra);
+    }
+
+    /// 这条调用在内核侧的事实（§14.2 对账的输入）。
+    fn facts_for<'a>(&self, key: &str, call: &Call, e: &'a Evidence) -> Facts<'a> {
+        Facts {
+            kernel_available: self.cfg.kernel_available,
+            linked: e.kernel_events > 0,
+            session_linked: self.cfg.pid_linked,
+            in_window: self.window_ok(key, call),
+            write_paths: &e.kb.write_paths,
+            net_targets: &e.kb.net_targets,
+            exec_seen: e.kb.exec_seen,
+        }
+    }
+
+    /// 这条调用落没落在内核观测窗口里（见 [`lineage::Facts::in_window`]）。
+    ///
+    /// 两个满足条件之一：调用发生在采集开始之后（`tool.call` 的 ts 晚于第一条
+    /// 内核事件），或者这条调用本来就挂上了内核事件（那它当然在窗口里）。
+    fn window_ok(&self, key: &str, call: &Call) -> bool {
+        if self.ev.get(key).is_some_and(|e| e.kernel_events > 0) {
+            return true;
+        }
+        match self.kernel_first_wall {
+            Some(k) => call.ts_ns >= k,
+            // 一条内核行都没看见过：窗口是空的，"在窗口内"不成立。
+            None => false,
+        }
+    }
+
+    /// 血缘行与内容嗅探（v0.6 §14.1/§14.3），挂在一条已经成形的失败记录上。
+    fn attach_lineage(&mut self, key: &str, f: &mut Failure) {
+        f.lineage = self.lineage.chain(key);
+        for p in self.lineage.paths_of(key).iter().take(lineage::MAX_SNIFF) {
+            if let Some(v) = lineage::sniff(p) {
+                f.sniff.push(v);
+            }
+        }
     }
 
     /// 这条调用的链还"活着"吗 —— 未定论，或者已判定失败但还在等证据。
@@ -445,9 +706,12 @@ impl FailAttributor {
                     self.chains.remove(&key);
                 }
             }
-            Resolution::Failed => {
+            Resolution::Failed | Resolution::ClaimPending => {
                 // 结果进链缓冲，整条链**等结论一起放**：归因行还没算出来，
                 // 先放链头/子树就等于给读者一段没有结论的片段。
+                //
+                // claim 核对走同一条路是刻意的：它的结论也可能是"这条链有问题"
+                // （§14.2 的对不上），而那正是读者要看见的整条链。
                 if let Some(key) = belongs {
                     self.chains.entry(key).or_default().push(ev);
                 }
@@ -475,6 +739,13 @@ impl FailAttributor {
         if ev.from_kernel_collector() || ev.is_collapse() {
             self.kernel_events_seen += 1;
             self.kernel_watermark = self.kernel_watermark.max(ev.ts_wall_ns);
+            if ev.ts_wall_ns > 0 {
+                // 观测窗口的左沿（§14.2 的门槛之一）。
+                self.kernel_first_wall = Some(match self.kernel_first_wall {
+                    Some(k) => k.min(ev.ts_wall_ns),
+                    None => ev.ts_wall_ns,
+                });
+            }
         }
     }
 
@@ -539,6 +810,19 @@ impl FailAttributor {
                 self.pending.retain(|p| p.key != old);
             }
         }
+        // v0.6 §14.1：每一次 `tool.call` 都在血缘表里占一步 —— 包括成功的那些，
+        // 因为"第 12 步引用了第 3 步的产物"里的第 3 步，往往是一次成功的调用。
+        // 命令行与输入预览都要喂进去：产物既可能写在 `Bash` 的 cmd 里，
+        // 也可能写在 `Read` 的 input 里（`{"file_path": "/tmp/report.pdf"}`）。
+        let args = match &ev.payload {
+            Payload::ToolCall {
+                input_preview,
+                bash_cmd,
+                ..
+            } => format!("{} {}", input_preview, bash_cmd.as_deref().unwrap_or("")),
+            _ => cmd.to_string(),
+        };
+        let step = self.lineage.on_call(&key, tool, &args, ev.ts_wall_ns);
         self.calls.insert(
             key.clone(),
             Call {
@@ -547,6 +831,7 @@ impl FailAttributor {
                 cmd: one_line(cmd),
                 ts_ns: ev.ts_ns,
                 resolved: false,
+                step,
             },
         );
         self.order.push_back(key.clone());
@@ -566,6 +851,10 @@ impl FailAttributor {
         }
         let e = self.ev.entry(id.to_string()).or_default();
         e.kernel_events += 1;
+        // v0.6 §14.2：写-open / connect 对端 / exec 三件事顺路记下来。
+        // 用的是**同一条**内核事件、同一份 join key —— claim 核对没有第二条
+        // 证据通道，它只能看这条调用挂住的东西。
+        e.kb.observe(ev);
         match &ev.payload {
             Payload::ProcExec { filename, argv, .. } => {
                 e.exec_file = Some(filename.clone());
@@ -644,9 +933,29 @@ impl FailAttributor {
             }
             None => return Resolution::None,
         };
+        // v0.6 §14.1：结果文本是血缘的第二半 —— 消费关系（"第 12 步引用了 X"）
+        // 大多写在结果里（`read /tmp/report.pdf`、`loaded /tmp/x.json`）。
+        self.lineage
+            .on_result(&key, !verdict, lineage::error_note(text), text);
         if !verdict {
-            self.ev.remove(&key);
-            return Resolution::Clean;
+            // 结果说它成功了。这里面有没有能被内核核对的话？（§14.2）
+            //
+            // 只有**有 claim** 才挂起：绝大多数成功调用没有任何 claim，
+            // 为它们各留一条待定记录会让 `pending` 变成一条长尾，
+            // 而它唯一的作用是几毫秒后自己把自己删掉。
+            if self.lineage.claims_of(&key).is_empty() {
+                self.ev.remove(&key);
+                return Resolution::Clean;
+            }
+            self.pending.push_back(Pending {
+                key,
+                src: ev.clone(),
+                text: text.to_string(),
+                detected_by,
+                call,
+                kind: PendingKind::Claim,
+            });
+            return Resolution::ClaimPending;
         }
 
         // 不下结论，只挂起：证据可能还在内核流里（文件头"什么时候下结论"）。
@@ -657,6 +966,7 @@ impl FailAttributor {
             text: text.to_string(),
             detected_by,
             call,
+            kind: PendingKind::Fail,
         });
         Resolution::Failed
     }
@@ -753,6 +1063,12 @@ impl FailAttributor {
             detected_by,
             tool_use_id: call.id.clone(),
             kernel_events: e.kernel_events,
+            step: call.step,
+            // 下面三项由调用方补（`attach_lineage` / `flush_claim_check`）：
+            // 它们要读 `self.lineage`，而这里只借到了 `&Evidence`。
+            lineage: Vec::new(),
+            claims: Vec::new(),
+            sniff: Vec::new(),
         }
     }
 }
@@ -901,6 +1217,14 @@ fn fail_event(src: &Event, call: &Call, f: &Failure, settle_note: &str) -> Event
     ));
     // 这条说明"我们等到了什么才敢下结论" —— 审计一句 `XX` 时最先要看的就是它。
     notes.push(format!("conclusion deferred until: {}", settle_note));
+    // v0.6：血缘与内容嗅探的每一行都在这里留档 —— 它们是**用户态推断**，
+    // 屏幕上的行文已经这么说了，json 里也必须留着同一句话。
+    for l in &f.lineage {
+        notes.push(format!("lineage (userspace inference, no kernel evidence): {}", l));
+    }
+    for s in &f.sniff {
+        notes.push(format!("content sniff (userspace heuristic, not kernel evidence): {}", s));
+    }
     Event {
         seq: 0,
         ts_ns: src.ts_ns,
@@ -916,6 +1240,7 @@ fn fail_event(src: &Event, call: &Call, f: &Failure, settle_note: &str) -> Event
         cgroup_id: None,
         corr: src.corr.clone(),
         payload: Payload::Fail {
+            step: f.step,
             tool: f.tool.clone(),
             cmd_preview: f.cmd.clone(),
             class: f.class.clone(),
@@ -925,6 +1250,45 @@ fn fail_event(src: &Event, call: &Call, f: &Failure, settle_note: &str) -> Event
         },
         trunc: Vec::new(),
         notes,
+        late: false,
+        watch: false,
+        binding: Binding::None,
+        retry: false,
+    }
+}
+
+/// 构造一条 `derived.claim` 行：claim vs kernel 的**其余**几列。
+///
+/// 为什么要另一种 kind 而不是把几列都塞进 `XX` 行：一条 `tool.result` 里可能同时
+/// 有"写了 /tmp/x.pdf"和"下了 https://…"两句话，它们是**两笔**对账。第一笔
+/// （不一致的那些）说了算 `XX` 行，其余各占一行。它们渲染成 `derived`（不是
+/// 红色 `XX`）是准确的 —— 只有不一致才是问题，对上的那笔只是核实过的事实。
+fn claim_event(src: &Event, call: &Call, c: &ClaimVsKernel) -> Event {
+    Event {
+        seq: 0,
+        ts_ns: src.ts_ns,
+        ts_wall_ns: src.ts_wall_ns,
+        ts_src: src.ts_src,
+        layer: Layer::Derived,
+        kind: Kind::DerivedClaim,
+        source: "lineage".into(),
+        pid: None,
+        tid: None,
+        ppid: None,
+        comm: None,
+        cgroup_id: None,
+        corr: src.corr.clone(),
+        payload: Payload::Claim {
+            claim: c.claim.clone(),
+            kernel: c.kernel.clone(),
+            mismatch: c.mismatch,
+        },
+        trunc: Vec::new(),
+        notes: vec![format!(
+            "claim vs kernel for tool.call {} step {}: extracted from the tool.result text \
+             (userspace) and checked against the kernel events bound to this call",
+            call.tool, call.step
+        )],
         late: false,
         watch: false,
         binding: Binding::None,
@@ -1046,6 +1410,27 @@ mod tests {
         e
     }
 
+    /// 一条**写意图** open（真机上的 `curl -o x` 就是这个形状：0x241 = W|CREAT|TRUNC）。
+    /// 路径按内核原样给：`openat` 记的是**原始实参**，通常相对 cwd。
+    fn open_write(ts: u64, id: &str, pid: u32, path: &str) -> Event {
+        let mut e = kernel(
+            ts,
+            id,
+            pid,
+            Payload::FileOpen {
+                path: path.into(),
+                flags: 0x241,
+                dirfd: -100,
+                path_is_relative: true,
+                ok: true,
+                errno: 0,
+            },
+        );
+        e.kind = Kind::InfraFileOpen;
+        e.layer = Layer::Infra;
+        e
+    }
+
     fn exit_code(ts: u64, id: &str, pid: u32, code: i64) -> Event {
         let mut e = kernel(ts, id, pid, Payload::ProcExit { exit_code: code });
         e.kind = Kind::RuntimeProcExit;
@@ -1064,6 +1449,7 @@ mod tests {
             only: false,
             kernel_available: true,
             settle_ns: 0,
+            pid_linked: false,
         }
     }
 
@@ -1264,6 +1650,71 @@ mod tests {
         assert!(out.iter().all(|e| e.kind != Kind::DerivedFail));
     }
 
+    /// **实测回归**（一次真实 `claude -p` 抓包，见 V06_RUN.log acceptance #4）。
+    ///
+    /// 结果文本说 `Saved to /tmp/…/work/q3.pdf`，而 curl 的**落盘 open 晚于**
+    /// `tool.result` 到来；exec/fork 却早就在结果之前挂上了这条调用。修复前
+    /// `settle` 的判据是"已经有内核事件挂上了 → 可以下结论"，于是那一刻就写出
+    /// `no write open observed !!` —— 把一次真写真成了没写（真机上复现了两次）。
+    ///
+    /// 对账必须等水印越过 `结果时刻 + settle 窗口`：它说的是"整段流里都没有"，
+    /// 而"整段流"在结果到达时还没走完。
+    #[test]
+    fn a_write_landing_after_the_result_is_not_reported_as_missing() {
+        let cfg = FailCfg {
+            only: false,
+            kernel_available: true,
+            settle_ns: 100 * 1_000_000, // 100ms，与 main.rs 的 merge-window 默认值同量级
+            pid_linked: false,
+        };
+        let mut a = FailAttributor::new(cfg);
+        // exec 先到（curl 起进程），结果随后 —— 这正是真实顺序。
+        let out = a.process(vec![
+            call(1 * S, "t1", "Bash", "curl -s -o work/q3.pdf https://example.com/q3-revenue.pdf"),
+            exec_argv(1 * S, "t1", 42, "/usr/bin/curl", &["curl", "-s", "-o", "work/q3.pdf"]),
+            result(2 * S, "t1", "Bash", "Success", "stdout: Saved to /tmp/v06demo2/work/q3.pdf"),
+        ]);
+        assert!(
+            a.failures.is_empty(),
+            "结果一到、内核只挂上了 exec 就抢答了: {:?}",
+            a.failures
+        );
+        assert!(out.iter().all(|e| e.kind != Kind::DerivedFail), "抢在落盘前写了归因行");
+
+        // 30ms 后 curl 才落盘：内核看到的是**相对**路径（openat 的原始实参）。
+        let _ = a.process(vec![open_write(2 * S + 30_000_000, "t1", 42, "work/q3.pdf")]);
+        assert!(
+            a.failures.is_empty(),
+            "一次真写被喊成了没写: {:?}",
+            a.failures.iter().map(|f| &f.head).collect::<Vec<_>>()
+        );
+        assert_eq!(a.claims_mismatched, 0);
+    }
+
+    /// 反过来：落盘**始终没来**时，这句话照样要说，而且要等到水印走过后再说。
+    #[test]
+    fn a_claim_with_no_write_at_all_is_still_reported_after_the_watermark() {
+        let cfg = FailCfg {
+            only: false,
+            kernel_available: true,
+            settle_ns: 100 * 1_000_000,
+            pid_linked: false,
+        };
+        let mut a = FailAttributor::new(cfg);
+        a.process(vec![
+            call(1 * S, "t1", "Bash", "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf ; echo Saved"),
+            exec_argv(1 * S, "t1", 42, "/usr/bin/curl", &["curl", "-s", "-o", "work/gone.pdf"]),
+            result(2 * S, "t1", "Bash", "Success", "stdout: Saved to /tmp/v06demo2/work/gone.pdf"),
+        ]);
+        assert!(a.failures.is_empty(), "还没等水印就下结论了");
+        // 一条**别处**的内核行把水印推过 结果+窗口：现在可以说了。
+        a.process(vec![exec_ok(3 * S, "t9", 99, "/usr/bin/true")]);
+        assert_eq!(a.failures.len(), 1, "水印走过后仍然没有对账");
+        assert!(a.failures[0].head.contains("no write open observed"), "{}", a.failures[0].head);
+        assert!(a.failures[0].head.ends_with("!!"));
+        assert_eq!(a.claims_mismatched, 1);
+    }
+
     /// 成功的结果文本里出现 `exit=7` 之类的字面量，**不能**被读成失败。
     #[test]
     fn shell_exit_literals_in_a_success_result_are_not_failures() {
@@ -1272,6 +1723,7 @@ mod tests {
                 only: false,
                 kernel_available: false,
                 settle_ns: 0,
+                pid_linked: false,
             },
             vec![
                 call(1 * S, "t1", "Bash", "curl -s -m 3 http://127.0.0.1:9/ ; echo \"exit=$?\""),
@@ -1290,6 +1742,7 @@ mod tests {
                 only: false,
                 kernel_available: false,
                 settle_ns: 0,
+                pid_linked: false,
             },
             vec![
                 call(1 * S, "t1", "Bash", "ls /x"),
@@ -1326,6 +1779,7 @@ mod tests {
             only: true,
             kernel_available: true,
             settle_ns: 0,
+            pid_linked: false,
         };
         let evs = vec![
             // 一条与失败无关的模型行：必须被丢掉
@@ -1371,6 +1825,7 @@ mod tests {
             only: true,
             kernel_available: true,
             settle_ns: 0,
+            pid_linked: false,
         };
         let (out, f) = run(
             cfg,
@@ -1483,6 +1938,7 @@ mod tests {
             only: false,
             kernel_available: true,
             settle_ns: 100 * 1_000_000, // 100ms
+            pid_linked: false,
         };
         let mut a = FailAttributor::new(cfg);
         let first = a.process(vec![

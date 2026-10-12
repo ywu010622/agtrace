@@ -7,6 +7,7 @@
 pub mod aya;
 pub mod bpftrace;
 pub mod child;
+pub mod replay;
 
 use crate::event::{Binding, Corr, Event, Kind, Layer, Payload, TruncNote, TsSource, errno_label, one_line};
 use crate::poll::PollOutcome;
@@ -34,6 +35,12 @@ pub trait Collector: Send {
 pub enum KernelCollector {
     Aya(aya::AyaCollector),
     Bpftrace(bpftrace::BpftraceCollector),
+    /// v0.6：回放一份**已经采到的**内核行文件（`--kernel-lines`）。
+    ///
+    /// 它不是第三个采集后端 —— 它谁也不 attach，只是把同一套行协议重新喂一遍。
+    /// 用 `Box` 是因为它比另两个变体大得多（整份文件在内存里），
+    /// 而 `KernelCollector` 会被按值放进 `Option<…>` 到处传。
+    Replay(Box<replay::KernelReplay>),
 }
 
 impl KernelCollector {
@@ -43,10 +50,19 @@ impl KernelCollector {
         matches!(self, KernelCollector::Aya(_))
     }
 
+    /// v0.6：这一轮的"内核侧"是不是一份回放文件。
+    ///
+    /// 两个地方要问它：启动时的"内核采集没有自然结尾"注记（回放**有**自然结尾，
+    /// 那句话在回放里是假的），以及 target 描述。
+    pub fn is_replay(&self) -> bool {
+        matches!(self, KernelCollector::Replay(_))
+    }
+
     pub fn exited(&self) -> bool {
         match self {
             KernelCollector::Aya(c) => c.exited(),
             KernelCollector::Bpftrace(c) => c.exited(),
+            KernelCollector::Replay(c) => c.exited(),
         }
     }
 
@@ -61,6 +77,7 @@ impl KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.exit_code(),
             KernelCollector::Bpftrace(c) => c.exit_code(),
+            KernelCollector::Replay(c) => c.exit_code(),
         }
     }
 
@@ -68,6 +85,7 @@ impl KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.redacted_events(),
             KernelCollector::Bpftrace(c) => c.redacted_events(),
+            KernelCollector::Replay(c) => c.redacted_events(),
         }
     }
 
@@ -75,6 +93,7 @@ impl KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.parse_stats(),
             KernelCollector::Bpftrace(c) => c.parse_stats(),
+            KernelCollector::Replay(c) => c.parse_stats(),
         }
     }
 
@@ -82,6 +101,7 @@ impl KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.stderr_tail(),
             KernelCollector::Bpftrace(c) => c.stderr_tail(),
+            KernelCollector::Replay(c) => c.stderr_tail(),
         }
     }
 
@@ -89,6 +109,7 @@ impl KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.unfinished_line_bytes(),
             KernelCollector::Bpftrace(c) => c.unfinished_line_bytes(),
+            KernelCollector::Replay(c) => c.unfinished_line_bytes(),
         }
     }
 
@@ -98,6 +119,7 @@ impl KernelCollector {
         match self {
             KernelCollector::Aya(c) => &c.rendered_script,
             KernelCollector::Bpftrace(c) => &c.rendered_script,
+            KernelCollector::Replay(c) => &c.rendered_script,
         }
     }
 
@@ -114,6 +136,7 @@ impl Collector for KernelCollector {
         match self {
             KernelCollector::Aya(c) => Collector::id(c),
             KernelCollector::Bpftrace(c) => Collector::id(c),
+            KernelCollector::Replay(c) => c.id(),
         }
     }
 
@@ -121,6 +144,7 @@ impl Collector for KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.poll(out),
             KernelCollector::Bpftrace(c) => c.poll(out),
+            KernelCollector::Replay(c) => Collector::poll(c.as_mut(), out),
         }
     }
 
@@ -128,6 +152,7 @@ impl Collector for KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.shutdown(),
             KernelCollector::Bpftrace(c) => c.shutdown(),
+            KernelCollector::Replay(c) => Collector::shutdown(c.as_mut()),
         }
     }
 
@@ -135,6 +160,7 @@ impl Collector for KernelCollector {
         match self {
             KernelCollector::Aya(c) => c.lost_events(),
             KernelCollector::Bpftrace(c) => c.lost_events(),
+            KernelCollector::Replay(c) => c.lost_events(),
         }
     }
 }

@@ -1,0 +1,5 @@
+{"type":"prompt","text":"download the Q3 report","ts":0}
+{"type":"tool.call","id":"c1","tool":"Bash","command":"curl -sL https://example.com/q3/report.pdf -o $DIR/work/report.pdf","ts":300}
+{"type":"tool.result","id":"c1","status":"success","output":"Saved to $DIR/work/report.pdf (128431 bytes)","ts":900}
+{"type":"tool.call","id":"c2","tool":"Read","input":{"file_path":"$DIR/work/report.pdf"},"ts":1400}
+{"type":"tool.result","id":"c2","status":"success","output":"Q3 revenue up 12% ...","ts":1700}

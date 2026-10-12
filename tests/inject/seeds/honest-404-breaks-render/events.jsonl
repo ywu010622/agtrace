@@ -1,0 +1,5 @@
+{"type":"prompt","text":"fetch the report and render page 1","ts":0}
+{"type":"tool.call","id":"c1","tool":"Bash","command":"curl -sL https://example.com/r.pdf -o $DIR/work/r.pdf","ts":200}
+{"type":"tool.result","id":"c1","status":"error","output":"HTTP 404 Not Found\nExit code 22","ts":700}
+{"type":"tool.call","id":"c2","tool":"Bash","command":"display_pdf $DIR/work/r.pdf","ts":1000}
+{"type":"tool.result","id":"c2","status":"error","output":"display_pdf: blank render (0 bytes)\nExit code 1","ts":1400}

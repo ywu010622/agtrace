@@ -1,0 +1,5 @@
+{"type":"prompt","text":"fetch the quarterly report and render page 1","ts":0}
+{"type":"tool.call","id":"c1","tool":"Bash","command":"curl -sL https://example.com/q3.pdf -o $DIR/work/q3.pdf","ts":300}
+{"type":"tool.result","id":"c1","status":"success","output":"Saved to $DIR/work/q3.pdf (1347 bytes)","ts":900}
+{"type":"tool.call","id":"c2","tool":"Bash","command":"display_pdf $DIR/work/q3.pdf","ts":1200}
+{"type":"tool.result","id":"c2","status":"error","output":"display_pdf: blank render (0 bytes)\nExit code 1","ts":1600}

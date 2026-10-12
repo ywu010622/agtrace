@@ -1,0 +1,5 @@
+{"type":"prompt","text":"pull the manifest and read it","ts":0}
+{"type":"tool.call","id":"c1","tool":"Bash","command":"curl -sL https://10.1.2.3/x.json -o $DIR/work/x.json","ts":300}
+{"type":"tool.result","id":"c1","status":"success","output":"Downloaded https://10.1.2.3/x.json to $DIR/work/x.json (2048 bytes)","ts":900}
+{"type":"tool.call","id":"c2","tool":"Read","input":{"file_path":"$DIR/work/x.json"},"ts":1400}
+{"type":"tool.result","id":"c2","status":"success","output":"{\"version\": 3}","ts":1700}

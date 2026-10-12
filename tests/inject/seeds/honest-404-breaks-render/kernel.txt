@@ -1,0 +1,9 @@
+EXEC|300|5150|5150|1|0|3|bash|/usr/bin/bash
+ARGV|300|5150|5150|0|bash
+ARGV|300|5150|5150|1|-c
+ARGV|300|5150|5150|2|curl -sL https://example.com/r.pdf -o $DIR/work/r.pdf
+CONN|320|5150|5150|1|0|3|2|443|-111|93.184.216.34
+EXEC|1100|5250|5250|1|0|3|bash|/usr/bin/bash
+ARGV|1100|5250|5250|0|bash
+ARGV|1100|5250|5250|1|-c
+ARGV|1100|5250|5250|2|display_pdf $DIR/work/r.pdf

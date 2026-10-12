@@ -1,0 +1,4 @@
+EXEC|400|4300|4300|1|0|3|bash|/usr/bin/bash
+ARGV|400|4300|4300|0|bash
+ARGV|400|4300|4300|1|-c
+ARGV|400|4300|4300|2|curl -sL https://10.1.2.3/x.json -o $DIR/work/x.json
