@@ -1646,3 +1646,86 @@ type into `jq`. Both are stable.
 failure (`status=Failure`, or the text signature when the status was unreadable) so that
 "is this really a failure?" is auditable rather than asserted. Each `XX` row also carries a note
 saying what it waited for before concluding (one of the three cases in §13.5).
+
+## 14. Cross-layer causal tracing (roadmap)
+
+### 14.1 The chain
+
+The direction agtrace is walking toward:
+
+```
+Trace ID / Span ID
+       ↓
+Agent Tool Call ID
+       ↓
+Process / Thread / Cgroup
+       ↓
+Syscall / File / Network
+       ↓
+Kernel Failure / Resource Contention
+```
+
+What it buys: not "a span took 8 seconds", but "of those 8 seconds, how much went
+to process creation, whether permission-denied retries happened, whether a failed
+connect was the real root cause, how many actual commands one logical tool call
+executed". v0.4-v0.6 built the bottom three layers of this chain (process binding,
+syscall evidence, artifact lineage); the top (trace/span identity) is future work.
+
+### 14.2 The core challenge is attribution, not collection
+
+Reliable causal attribution across async tasks, threads, and process boundaries --
+not more events. PID plus a time window is not enough: the same command can appear
+twice, a shell builtin never execs, and a file descriptor gets reused. Every hop in
+the chain in 14.1 needs a join key, and the honesty of the tool is bounded by the
+quality of those keys (see 1.3, 13.4).
+
+### 14.3 Join keys cost intrusion
+
+This is the tradeoff the roadmap does not hide. Join keys are bought with
+intrusion, and agtrace's zero-intrusion stance is both its wedge and its ceiling:
+
+- **Level 0 (current):** PID + argv heuristics + time windows. Zero intrusion.
+  Documented limits: cross-wiring on identical commands, no exec for builtins.
+- **Level 1 (in progress):** in-host join keys that need no cooperation --
+  fd->socket->process->thread tracking. v0.4.2's sendto peer attribution was the
+  first step. This is the most that can be dug out without touching the agent.
+- **Level 2 (not agtrace's job):** per-tool-call cgroup, or trace context injected
+  into the subprocess environment. Exact attribution, but it requires the
+  launcher/sandbox to cooperate. That is sandbox infrastructure's job -- the
+  observer consumes join keys; it does not impose them.
+
+The full form of the chain requires moving up this ladder. That decision belongs
+to the deployment, not to the tool.
+
+### 14.4 OpenTelemetry: export, not ingest
+
+agtrace will speak OTel on **output**: derived causal chains (artifact lineage,
+claim-vs-kernel mismatches) emitted as OTel spans, so they land in Jaeger/Grafana
+next to everything else. It will not attempt to ingest arbitrary OTel traces and
+correlate them -- that is a different product, in a crowded space (Pixie,
+groundcover, and friends already do span<->syscall for microservices).
+
+OTel is the output plug, not the soul. The soul is agent-specific semantic depth --
+thinking blocks, `tool_use_id` pairing, turn structure -- crossed with kernel
+evidence. That combination is what HTTP spans don't have, and it is why agtrace
+stays an agent debugger rather than becoming a generic distributed tracer.
+
+### 14.5 What agtrace will not become
+
+- A generic distributed tracer. Multi-host tracing is out of scope; single-machine
+  agent debugging is the wedge.
+- A TLS-plaintext sniffer. Not doing it is a deliberate decision, not an
+  oversight.
+- A file-content capturer. eBPF write-content capture is heavy; the magic-number
+  sniff (v0.6) is the 80/20 for gross content mismatches.
+
+### 14.6 Capability table (2026-10-12, honest)
+
+| Capability | Status |
+|---|---|
+| Agent Tool Call <-> Process | argv matching (exact/substring/segment) + time window; cross-wires on identical commands; builtins have no exec |
+| Process <-> Syscall | tracepoints: fork/exec/exit/openat/connect/sendto; no read/write content |
+| Tool Call <-> File/Network events | indirect, via process binding |
+| OTel Span <-> System events | no generic integration; OTel export of derived chains planned (14.4) |
+| Cross-service / multi-host | not planned |
+| File content / HTTP semantics | paths and fds only; magic-sniff heuristic for gross mismatches |
