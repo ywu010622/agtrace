@@ -1,0 +1,29 @@
+# Standalone workspace: the eBPF crate builds for `bpfel-unknown-none` on
+# nightly with `-Z build-std=core`, which the host workspace deliberately does
+# not inherit. `src/../build.rs` drives this build automatically, so a plain
+# `cargo build --release` at the repository root produces the object file
+# without the caller having to know any of this.
+[workspace]
+
+[package]
+name = "agtrace-ebpf"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agtrace-ebpf-common = { path = "../agtrace-ebpf-common" }
+aya-ebpf = "0.1.1"
+
+[[bin]]
+name = "agtrace-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"

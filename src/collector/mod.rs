@@ -4,7 +4,9 @@
 //! 每行 = 一个内核事件。未来 aya / C+libbpf 实现只需产出同样的行格式，
 //! 这里的 parser 与 merger 完全不用改。
 
+pub mod aya;
 pub mod bpftrace;
+pub mod child;
 
 use crate::event::{Binding, Corr, Event, Kind, Layer, Payload, TruncNote, TsSource, errno_label, one_line};
 use crate::poll::PollOutcome;
@@ -20,6 +22,120 @@ pub trait Collector: Send {
     /// 采集器自报的丢包计数（已通过 `collector.lost_events` 事件呈现，这里只做统计）。
     fn lost_events(&self) -> u64 {
         0
+    }
+}
+
+/// Either kernel collector, behind the API the main loop already used.
+///
+/// v0.5 added a second implementation of the same line protocol. An enum rather
+/// than `Box<dyn Collector>` because the main loop also reads bpftrace-only
+/// diagnostics (`rendered_script`, `keep_script`) that would otherwise force a
+/// downcast at every call site; the two variants are known and closed.
+pub enum KernelCollector {
+    Aya(aya::AyaCollector),
+    Bpftrace(bpftrace::BpftraceCollector),
+}
+
+impl KernelCollector {
+    /// Whether the events on this stream are labelled `aya` (for the startup
+    /// banner and the "no natural end" note, which name the mechanism).
+    pub fn is_aya(&self) -> bool {
+        matches!(self, KernelCollector::Aya(_))
+    }
+
+    pub fn exited(&self) -> bool {
+        match self {
+            KernelCollector::Aya(c) => c.exited(),
+            KernelCollector::Bpftrace(c) => c.exited(),
+        }
+    }
+
+    /// The collector's own exit status, once it is gone. `None` while it runs.
+    ///
+    /// The privileged loader exits non-zero when it refuses to do its job (a
+    /// tracepoint this kernel does not have, a verifier rejection). Without this,
+    /// such a run looks identical from the parent to a clean one that simply
+    /// captured nothing — which is the failure mode the whole line protocol
+    /// exists to make visible.
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            KernelCollector::Aya(c) => c.exit_code(),
+            KernelCollector::Bpftrace(c) => c.exit_code(),
+        }
+    }
+
+    pub fn redacted_events(&self) -> u64 {
+        match self {
+            KernelCollector::Aya(c) => c.redacted_events(),
+            KernelCollector::Bpftrace(c) => c.redacted_events(),
+        }
+    }
+
+    pub fn parse_stats(&self) -> &ParseStats {
+        match self {
+            KernelCollector::Aya(c) => c.parse_stats(),
+            KernelCollector::Bpftrace(c) => c.parse_stats(),
+        }
+    }
+
+    pub fn stderr_tail(&self) -> &[String] {
+        match self {
+            KernelCollector::Aya(c) => c.stderr_tail(),
+            KernelCollector::Bpftrace(c) => c.stderr_tail(),
+        }
+    }
+
+    pub fn unfinished_line_bytes(&self) -> usize {
+        match self {
+            KernelCollector::Aya(c) => c.unfinished_line_bytes(),
+            KernelCollector::Bpftrace(c) => c.unfinished_line_bytes(),
+        }
+    }
+
+    /// The `-v` fingerprint: the expanded script for bpftrace, the attach
+    /// configuration for aya.
+    pub fn rendered_script(&self) -> &str {
+        match self {
+            KernelCollector::Aya(c) => &c.rendered_script,
+            KernelCollector::Bpftrace(c) => &c.rendered_script,
+        }
+    }
+
+    /// `--keep-script` only means something when there is a script.
+    pub fn set_keep_script(&mut self, v: bool) {
+        if let KernelCollector::Bpftrace(c) = self {
+            c.keep_script = v;
+        }
+    }
+}
+
+impl Collector for KernelCollector {
+    fn id(&self) -> &'static str {
+        match self {
+            KernelCollector::Aya(c) => Collector::id(c),
+            KernelCollector::Bpftrace(c) => Collector::id(c),
+        }
+    }
+
+    fn poll(&mut self, out: &mut Vec<Event>) -> Result<PollOutcome, CollectorError> {
+        match self {
+            KernelCollector::Aya(c) => c.poll(out),
+            KernelCollector::Bpftrace(c) => c.poll(out),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        match self {
+            KernelCollector::Aya(c) => c.shutdown(),
+            KernelCollector::Bpftrace(c) => c.shutdown(),
+        }
+    }
+
+    fn lost_events(&self) -> u64 {
+        match self {
+            KernelCollector::Aya(c) => c.lost_events(),
+            KernelCollector::Bpftrace(c) => c.lost_events(),
+        }
     }
 }
 
@@ -90,6 +206,11 @@ fn is_sensitive_path(path: &str) -> bool {
 pub struct KernelLineParser {
     /// bpftrace `str()` 的字节上限（由 `BPFTRACE_MAX_STRLEN` 决定），用于判定截断。
     str_limit: usize,
+    /// Which collector produced these lines. The parser is shared with the aya
+    /// collector (v0.5), so the label is a parameter rather than a constant: an
+    /// aya run that reported its events as `source: "bpftrace"` would make `-v`
+    /// and `--output json` lie about where the data came from.
+    source_label: &'static str,
     /// 凭据打码模式（§5.3）。**默认 argv**：这是设计决策不是可选项 ——
     /// 一个用来做安全调查的工具，若默认把密钥写进输出，它本身就成了新的泄漏面。
     redact: RedactMode,
@@ -124,6 +245,7 @@ impl KernelLineParser {
     pub fn with_redact(str_limit: usize, redact: RedactMode) -> Self {
         KernelLineParser {
             str_limit,
+            source_label: "bpftrace",
             redact,
             redacted_events: 0,
             stats: ParseStats::default(),
@@ -134,9 +256,14 @@ impl KernelLineParser {
         }
     }
 
-    /// 设置 --file-all（BpftraceCollector::spawn 调用）。
+    /// 设置 --file-all（两个采集器的 spawn 都会调用）。
     pub fn set_file_all(&mut self, v: bool) {
         self.file_all = v;
+    }
+
+    /// 标注这批行的来源采集器（`-v` 与 json 输出里可见）。
+    pub fn set_source_label(&mut self, label: &'static str) {
+        self.source_label = label;
     }
 
     /// 取下一个 seq。
@@ -335,7 +462,7 @@ impl KernelLineParser {
             } else {
                 Kind::RuntimeProcExec
             },
-            source: "bpftrace".into(),
+            source: self.source_label.into(),
             pid,
             tid,
             ppid,
@@ -378,7 +505,7 @@ impl KernelLineParser {
             ts_src: TsSource::Kernel,
             layer: Layer::Runtime,
             kind: Kind::RuntimeProcFork,
-            source: "bpftrace".into(),
+            source: self.source_label.into(),
             pid: f[2].parse().ok(),
             tid: None,
             ppid: f[3].parse().ok(),
@@ -420,7 +547,7 @@ impl KernelLineParser {
             ts_src: TsSource::Kernel,
             layer: Layer::Runtime,
             kind: Kind::RuntimeProcExit,
-            source: "bpftrace".into(),
+            source: self.source_label.into(),
             pid: f[2].parse().ok(),
             tid: None,
             ppid: f[3].parse().ok(),
@@ -477,7 +604,7 @@ impl KernelLineParser {
             ts_src: TsSource::Kernel,
             layer: Layer::Infra,
             kind: Kind::InfraFileOpen,
-            source: "bpftrace".into(),
+            source: self.source_label.into(),
             pid: f[2].parse().ok(),
             tid: f[3].parse().ok(),
             ppid: f[4].parse().ok(),
@@ -548,7 +675,7 @@ impl KernelLineParser {
             ts_src: TsSource::Kernel,
             layer: Layer::Infra,
             kind: Kind::InfraNetConnect,
-            source: "bpftrace".into(),
+            source: self.source_label.into(),
             pid: f[2].parse().ok(),
             tid: f[3].parse().ok(),
             ppid: f[4].parse().ok(),
@@ -628,7 +755,7 @@ impl KernelLineParser {
             ts_src: TsSource::Kernel,
             layer: Layer::Infra,
             kind: Kind::InfraNetSendto,
-            source: "bpftrace".into(),
+            source: self.source_label.into(),
             pid: f[2].parse().ok(),
             tid: f[3].parse().ok(),
             ppid: f[4].parse().ok(),

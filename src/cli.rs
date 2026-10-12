@@ -92,6 +92,10 @@ pub struct Cli {
     /// json 依然逐事件无损 —— 被剪掉的是整条链，不是链里的字段。
     pub failures_only: bool,
 
+    // ---- 采集器（v0.5）----
+    /// 内核采集后端。默认 aya（进程内 eBPF），失败时**可见地**退回 bpftrace。
+    pub collector: CollectorBackend,
+
     // ---- 调试 ----
     pub keep_script: bool,
 }
@@ -127,7 +131,40 @@ impl Default for Cli {
             no_collapse: false,
             no_bind: false,
             failures_only: false,
+            collector: CollectorBackend::Aya,
             keep_script: false,
+        }
+    }
+}
+
+/// Which kernel collector to use (`--collector`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectorBackend {
+    /// In-process eBPF through `aya` (v0.5 default): no external program, so
+    /// `cargo install` alone is enough, and attachment is ~ms rather than the
+    /// 2-3 s `bpftrace` needs to parse and compile its script.
+    Aya,
+    /// The v0.4 `sudo bpftrace` subprocess. Kept working, and used automatically
+    /// (with a visible note) when aya cannot start on this machine.
+    Bpftrace,
+}
+
+impl CollectorBackend {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "aya" => Ok(CollectorBackend::Aya),
+            "bpftrace" => Ok(CollectorBackend::Bpftrace),
+            other => Err(format!(
+                "unknown --collector `{}` (available: aya | bpftrace)",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollectorBackend::Aya => "aya",
+            CollectorBackend::Bpftrace => "bpftrace",
         }
     }
 }
@@ -160,6 +197,10 @@ Behavior:
       --transcript <PATH>  explicit transcript file or directory
       --time-base <MODE>   fixture time anchor: now | wall | epoch   (default now)
       --source <LIST>      comma-separated: exec,file,net,agent      (default all)
+      --collector <NAME>   aya | bpftrace  (default aya)
+                           aya loads the eBPF programs in-process (no external tool,
+                           ~ms to attach). If it cannot start, agtrace says so on
+                           stderr and falls back to the bpftrace script.
       --merge-window <MS>  reorder window                            (default {mw})
       --resync-interval <S> clock offset resample, 0=off             (default {ri})
 
@@ -224,7 +265,8 @@ Failure attribution (DESIGN.md section 13; always on, one `XX` line per failed c
 
 Debug:
   -v, --verbose            show dropped/unknown events, loss stats, truncation details
-      --keep-script        keep the generated bpftrace script (for collector debugging)
+      --keep-script        keep the generated bpftrace script (for collector debugging;
+                           only meaningful with --collector bpftrace)
   -h, --help               show this help
   -V, --version            show version
 "#,
@@ -310,6 +352,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "--max-events" => cli.max_events = Some(parse_u64("--max-events", &take(&mut it, &name)?)?),
             "--duration" => cli.duration_secs = Some(parse_u64("--duration", &take(&mut it, &name)?)?),
 
+            "--collector" => cli.collector = CollectorBackend::parse(&take(&mut it, &name)?)?,
             "--redact" => cli.redact = RedactMode::parse(&take(&mut it, &name)?)?,
             "--file-all" => cli.file_all = true,
             "--argv-max" => cli.argv_max = parse_usize("--argv-max", &take(&mut it, &name)?)?,

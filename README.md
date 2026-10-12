@@ -12,7 +12,7 @@ An agent transcript tells you what the agent *intended* — tool calls, model te
 - the agent retried with the sandbox off, `curl` really executed, and exited 7 (connection refused)
 - a `tool.result` says "success" while the real work happened in a different process tree
 
-agtrace tails the agent transcript **and** traces the kernel (via bpftrace/eBPF) in real time, binding each `tool.call` to the processes it actually spawned — so you can see the exact point where intent and reality diverge.
+agtrace tails the agent transcript **and** traces the kernel (in-process eBPF) in real time, binding each `tool.call` to the processes it actually spawned — so you can see the exact point where intent and reality diverge.
 
 agtrace only **presents**. It never throttles, kills, edits config, or auto-remediates. Acting on what you see is a different tool's job.
 
@@ -27,7 +27,11 @@ agtrace only **presents**. It never throttles, kills, edits config, or auto-reme
 
 ## Quickstart
 
-Requirements: Linux, `bpftrace`, `sudo`, and an agent session to watch.
+Requirements: Linux with eBPF and BTF (`/sys/kernel/btf/vmlinux`), `sudo`, and an
+agent session to watch. Nothing else: the eBPF programs are loaded in-process by
+[aya](https://aya-rs.dev), so `bpftrace` is not a dependency. It is still
+supported as a fallback backend (`--collector bpftrace`) and used automatically
+only if the aya collector cannot start — with a note on stderr when that happens.
 
 ```bash
 cargo install --git https://github.com/ywu010622/agtrace
@@ -69,10 +73,14 @@ Machine-readable when you need it: `--output json` emits JSONL (one event per li
 ```
 agent transcript (JSONL, live tail) ─┐
                                      ├─► merge (200 ms window, one clock) ─► render
-kernel events (bpftrace probes) ─────┘        execve / fork / exit / openat / connect / sendto
+kernel events (eBPF tracepoints) ────┘        execve / fork / exit / openat / connect / sendto
 ```
 
-- **Collector**: a single bpftrace script (4 probe groups) compiled into the binary; filters by PID tree or cgroup — agtrace never traces system-wide.
+- **Collector**: eBPF tracepoint programs, built into the binary and loaded by `aya`
+  in-process (attach takes ~150 ms, versus 2-3 s for a `sudo bpftrace` subprocess —
+  short agent tasks used to finish before bpftrace was even attached). They filter by
+  PID tree or cgroup, seeded from userspace, so agtrace never traces system-wide. The
+  bpftrace script is still shipped and selected with `--collector bpftrace`.
 - **Adapters**: `claude-code` (default; transcript JSONL as a live feed), `openshell` (stub on the same event interface), `jsonl` (generic: tails a file of agent events — one JSON object per line — so custom agents can plug in; see below).
 - **Derived views**: binding, failure attribution, retry detection, watchlist — computed from evidence, never asserted without it. A failed call with no kernel evidence is reported as `no-kernel-source`, not guessed at.
 
@@ -109,7 +117,25 @@ tools correlate by time. Full schema: `src/adapter/jsonl.rs`.
 
 ## Status
 
-v0.4.1. Adapters: Claude Code (live), generic jsonl (LangChain/LangGraph/any). Single static Rust binary; `cargo test` green (174 tests) plus a `tests/real_cases.sh` regression suite replaying real captured sessions.
+v0.5.0. Adapters: Claude Code (live), generic jsonl (LangChain/LangGraph/any). Single
+static Rust binary; `cargo test` green (223 tests) plus a `tests/real_cases.sh`
+regression suite replaying real captured sessions.
+
+Building from source needs two things beyond a stable toolchain: a **nightly**
+toolchain (the eBPF crate is `no_std` and uses `-Z build-std=core`) and
+[`bpf-linker`](https://github.com/aya-rs/bpf-linker):
+
+```bash
+cargo install bpf-linker          # one-time: links the eBPF object
+cargo build --release             # builds the eBPF object and the binary
+```
+
+`cargo build --release` drives the nested eBPF build itself (see `build.rs`); there
+is no second command to run. Note that `rustup target add bpfel-unknown-none` does
+**not** work — that target has no prebuilt `core`, which is exactly why
+`.cargo/config.toml` sets `build-std`. If the eBPF toolchain is missing, the build
+prints a warning and produces a binary whose `--collector aya` degrades to bpftrace
+rather than failing.
 
 ## License
 

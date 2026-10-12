@@ -1,15 +1,32 @@
 [package]
 name = "agtrace"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 authors = ["Yuhang Wu"]
 license = "MIT"
 description = "strace for AI agents: a live timeline joining what the agent claims with what the kernel actually did"
 repository = "https://github.com/ywu010622/agtrace"
 keywords = ["agent", "tracing", "ebpf", "debugging", "llm"]
+# Builds `agtrace-ebpf` (nightly, bpfel-unknown-none) and embeds the resulting
+# object with `include_bytes!`, so one `cargo build --release` produces a
+# self-contained binary. See build.rs for the failure policy.
+build = "build.rs"
+
+[workspace]
+# The two eBPF crates are their own little world: they build for
+# `bpfel-unknown-none` on nightly with `-Z build-std=core`, which must not leak
+# into the host build. `agtrace-ebpf` already declares a standalone `[workspace]`;
+# listing both here keeps the host workspace from adopting the shared ABI crate.
+exclude = ["agtrace-ebpf", "agtrace-ebpf-common"]
 
 [dependencies]
 libc = "0.2.190"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
 toml = "1.1.8"
+# In-process eBPF loader (v0.5). Pure Rust — no libbpf, no C toolchain, which is
+# the whole point of dropping the `bpftrace` subprocess.
+aya = "0.14.0"
+# The record layout the eBPF programs fill in. Shared rather than duplicated so
+# the two sides cannot drift apart silently.
+agtrace-ebpf-common = { path = "agtrace-ebpf-common" }

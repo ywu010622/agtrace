@@ -1,0 +1,13 @@
+# Discovered relative to the *current directory*, which is why build.rs runs
+# cargo with `current_dir` pointing here rather than via `--manifest-path`.
+[build]
+target = "bpfel-unknown-none"
+
+# `bpfel-unknown-none` has no prebuilt core, and `rustup target add` refuses it
+# ("no prebuilt artifacts available"). Building the one crate that actually
+# needs it from source is the supported path.
+[unstable]
+build-std = ["core"]
+
+[target.bpfel-unknown-none]
+linker = "bpf-linker"

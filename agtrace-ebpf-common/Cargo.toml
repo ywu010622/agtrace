@@ -1,0 +1,16 @@
+# Shared ABI between the eBPF programs and their userspace loader.
+#
+# Built for the host by the main crate (which turns records into protocol
+# lines) and for `bpfel-unknown-none` by `agtrace-ebpf` (which fills them in).
+# Dependency-free and `no_std` so the same definitions compile for both.
+[package]
+name = "agtrace-ebpf-common"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "agtrace_ebpf_common"
+path = "src/lib.rs"
+
+[dependencies]

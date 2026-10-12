@@ -6,13 +6,17 @@
 //!     `grep`/`head`，否则 grep 的块缓冲会让输出长时间不出现。
 //!
 //! 非阻塞读取用 `fcntl(O_NONBLOCK)` + `libc::read`，不引入 tokio（§3.1 铁律）。
+//!
+//! v0.5：子进程的读写/收尾逻辑搬到 [`super::child::LineChild`]，与 aya 采集器共用。
+//! 这个文件现在只剩 bpftrace 特有的部分：脚本渲染、丢包文本解析的调用方，以及
+//! 临时脚本的生命周期。
 
-use super::{Collector, CollectorError, KernelLineParser, LineBuffer};
-use crate::event::{Binding, Corr, Event, Kind, Layer, Payload, TsSource};
+use super::child::LineChild;
+use super::{Collector, CollectorError, KernelLineParser};
+use crate::event::{Event, Kind};
 use crate::poll::PollOutcome;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 
 /// 单个内核字符串实际能带回来的字节数（**实测值，不是期望值**）。
 ///
@@ -40,26 +44,54 @@ pub enum Target {
     Cgroup { path: String, id: u64 },
 }
 
+/// Probe whether bpftrace can actually be run, before committing to it.
+///
+/// Asking for a collector whose binary is missing used to produce a *silently*
+/// empty timeline: `Command::new("sudo")` starts fine, `sudo` then fails to find
+/// the program, and the child is gone before anything explains why. The run
+/// looked like "the target did nothing" — the one failure mode this tool exists
+/// to make impossible. `--version` is enough to tell the two apart, costs a few
+/// tens of milliseconds against a collector that takes seconds to attach, and
+/// exercises the exact `sudo -n bpftrace` path the real spawn uses (so a sudo
+/// policy problem is reported as such rather than as a missing binary).
+pub fn precheck() -> Result<(), String> {
+    let out = Command::new("sudo")
+        .args(["-n", "bpftrace", "--version"])
+        .output()
+        .map_err(|e| format!("could not run `sudo -n bpftrace --version`: {}", e))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(probe_failure(
+        out.status.code(),
+        &String::from_utf8_lossy(&out.stderr),
+    ))
+}
+
+/// Turn a failed probe into a reason that never comes back empty.
+///
+/// Split out from [`precheck`] because a probe can only be *executed* against a
+/// real system, while the thing worth testing is that "failed with no output at
+/// all" still yields a sentence the user can act on — an unexplained fallback is
+/// the failure this whole path exists to avoid.
+pub fn probe_failure(code: Option<i32>, stderr: &str) -> String {
+    match stderr.lines().map(str::trim).find(|l| !l.is_empty()) {
+        Some(l) => l.to_string(),
+        None => format!(
+            "`sudo -n bpftrace --version` exited with status {:?} and said nothing",
+            code
+        ),
+    }
+}
+
 pub struct BpftraceCollector {
-    child: Child,
-    stdout_fd: RawFd,
-    stderr_fd: RawFd,
+    child: LineChild,
     parser: KernelLineParser,
-    out_buf: LineBuffer,
-    err_buf: LineBuffer,
-    /// 从 bpftrace stderr 里抓到的丢包计数（§2.5：`lost_events` / "Lost N events"）。
-    lost: u64,
-    /// 丢包计数是否已经作为事件上报过（避免重复刷屏）。
-    lost_reported: u64,
-    eof: bool,
-    child_exited: Option<i32>,
     /// 保留展开后的脚本，`-v` 时可打印用于排错。
     pub rendered_script: String,
     pub script_path: Option<std::path::PathBuf>,
     /// `--keep-script`：调试采集问题时保留生成的脚本（否则退出时删除）。
     pub keep_script: bool,
-    /// stderr 的原始累积（截断保存），`-v` 时展示。
-    pub stderr_tail: Vec<String>,
 }
 
 impl BpftraceCollector {
@@ -98,59 +130,31 @@ impl BpftraceCollector {
             .arg("-B")
             .arg("none") // 坑 #6
             .arg(&path)
-            .env("BPFTRACE_MAX_STRLEN", MAX_STRLEN.to_string()) // 坑 #9/#12：经 sudo 时到不了，见上
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("BPFTRACE_MAX_STRLEN", MAX_STRLEN.to_string()); // 坑 #9/#12：经 sudo 时到不了，见上
 
-        // 让 bpftrace 自成进程组。**这一步很重要**：`sudo` 在有些配置下会 fork 出
-        // 真正的 bpftrace，只 kill sudo 的 pid 会留下一个 **root 权限的 bpftrace
-        // 孤儿进程**继续挂着 kprobe 跑。按进程组杀才干净。
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
-
-        let child = cmd.spawn().map_err(|e| {
-            CollectorError::Spawn(format!(
-                "cannot start `sudo -n bpftrace` (needs bpftrace + passwordless sudo): {}",
-                e
-            ))
-        })?;
-
-        let stdout_fd = child.stdout.as_ref().unwrap().as_raw_fd();
-        let stderr_fd = child.stderr.as_ref().unwrap().as_raw_fd();
-        set_nonblocking(stdout_fd).map_err(|e| CollectorError::Io(e.to_string()))?;
-        set_nonblocking(stderr_fd).map_err(|e| CollectorError::Io(e.to_string()))?;
+        // 进程组 / 管道 / 非阻塞读取都由 LineChild 统一处理（见 child.rs）。
+        let child = LineChild::spawn(cmd, "bpftrace", "sudo -n bpftrace")?;
 
         Ok(BpftraceCollector {
             child,
-            stdout_fd,
-            stderr_fd,
             parser: {
                 let mut p = KernelLineParser::with_redact(MAX_STRLEN, redact);
                 p.set_file_all(file_all);
                 p
             },
-            out_buf: LineBuffer::new(),
-            err_buf: LineBuffer::new(),
-            lost: 0,
-            lost_reported: 0,
-            eof: false,
-            child_exited: None,
             rendered_script: script,
             script_path: Some(path),
             keep_script: false,
-            stderr_tail: Vec::new(),
         })
     }
 
     /// bpftrace 是否已经退出（用于判断"采集结束"）。
     pub fn exited(&self) -> bool {
-        self.child_exited.is_some()
+        self.child.exited()
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.child.exit_code()
     }
 
     /// 有多少个 exec 事件的 argv 因 `--redact` 被改动过。
@@ -163,37 +167,17 @@ impl BpftraceCollector {
         &self.parser.stats
     }
 
+    /// stderr 原始行（截断保存），`-v` 时展示。
+    pub fn stderr_tail(&self) -> &[String] {
+        &self.child.stderr_tail
+    }
+
     /// 缓冲区里还剩多少字节没凑成完整的一行。
     ///
     /// 采集结束时这个值 > 0 意味着**最后一行被截断了**（bpftrace 被 SIGTERM 打断）。
     /// 那一行不会被解析成事件，所以必须显式告诉用户 —— 否则就是静默丢失（§4.3）。
     pub fn unfinished_line_bytes(&self) -> usize {
-        self.out_buf.pending_bytes()
-    }
-
-    /// 读取 stderr 并从中提取丢包信号。
-    ///
-    /// §5.4 #2：`lost_events` 信封的**具体字段结构未验证**（无法可靠触发 perf buffer
-    /// 溢出 —— 本次实现又试了一次，`BPFTRACE_PERF_RB_PAGES=1` + 1000+ 事件仍未触发）。
-    /// 所以这里做**双路防御**：既认 bpftrace 的 stderr 文本，也认 JSON 信封
-    /// （`{"type":"lost_events", ...}` 里的任意数字字段）。哪条路来了都能报出来，
-    /// 报不出也不会假装没有 —— 见 BUILD_LOG.md 的诚实说明。
-    fn drain_stderr(&mut self) {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = unsafe { libc::read(self.stderr_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            for line in self.err_buf.push(&buf[..n as usize]) {
-                if let Some(c) = parse_lost(&line) {
-                    self.lost += c;
-                }
-                if self.stderr_tail.len() < 64 {
-                    self.stderr_tail.push(line);
-                }
-            }
-        }
+        self.child.unfinished_line_bytes()
     }
 }
 
@@ -203,122 +187,22 @@ impl Collector for BpftraceCollector {
     }
 
     fn poll(&mut self, out: &mut Vec<Event>) -> Result<PollOutcome, CollectorError> {
-        let mut progress = false;
-
-        // --- stdout：内核事件 ---
-        let mut buf = [0u8; 32768];
-        loop {
-            let n = unsafe { libc::read(self.stdout_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n > 0 {
-                progress = true;
-                for line in self.out_buf.push(&buf[..n as usize]) {
-                    self.parser.feed_line(&line, out);
-                }
-                continue;
-            }
-            if n == 0 {
-                // EOF：bpftrace 退出了。把残留的半行也吐出去（可能被 SIGTERM 截断）。
-                self.eof = true;
-                if let Some(rest) = self.out_buf.take_remainder() {
-                    // 半行**不当作完整事件解析**（§2.4）——只计数。
-                    self.parser.stats.lines_malformed += 1;
-                    let _ = rest;
-                }
-                break;
-            }
-            let err = io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EINTR) => break,
-                _ => break,
-            }
-        }
-
-        self.drain_stderr();
-
-        // --- 丢包：必须可见，绝不静默（§4.3）---
-        if self.lost > self.lost_reported {
-            let delta = self.lost - self.lost_reported;
-            self.lost_reported = self.lost;
-            out.push(Event {
-                seq: 0,
-                ts_ns: 0,
-                ts_wall_ns: 0,
-                ts_src: TsSource::Kernel,
-                layer: Layer::Derived,
-                kind: Kind::CollectorLostEvents,
-                source: "bpftrace".into(),
-                pid: None,
-                tid: None,
-                ppid: None,
-                comm: None,
-                cgroup_id: None,
-                corr: Corr::default(),
-                payload: Payload::LostEvents { count: delta },
-                trunc: Vec::new(),
-                notes: Vec::new(),
-                late: false,
-                watch: true,
-                binding: Binding::None,
-                retry: false,
-            });
-            progress = true;
-        }
-
-        // --- 子进程状态 ---
-        if self.child_exited.is_none() {
-            match self.child.try_wait() {
-                Ok(Some(st)) => {
-                    self.child_exited = Some(st.code().unwrap_or(-1));
-                    // 退出前把解析器里悬空的东西吐出来。
-                    self.parser.finish(out);
-                    progress = true;
-                }
-                Ok(None) => {}
-                Err(_) => {}
-            }
-        }
-
-        if progress {
-            Ok(PollOutcome::Progress)
-        } else if self.eof && self.child_exited.is_some() {
-            Ok(PollOutcome::Eof)
-        } else {
-            Ok(PollOutcome::Idle)
-        }
+        self.child.poll_lines(&mut self.parser, out)
     }
 
     fn shutdown(&mut self) {
-        // 先礼后兵：SIGTERM 整个进程组（负 pid），让 bpftrace 有机会跑 END{} 并
-        // detach kprobe；等不到就 SIGKILL。
-        let pid = self.child.id() as i32;
-        unsafe {
-            libc::kill(-pid, libc::SIGTERM);
-            libc::kill(pid, libc::SIGTERM);
-        }
-        for _ in 0..50 {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.shutdown();
     }
 
     fn lost_events(&self) -> u64 {
-        self.lost
+        self.child.lost_events()
     }
 }
 
 impl Drop for BpftraceCollector {
     fn drop(&mut self) {
-        if self.child_exited.is_none() {
-            self.shutdown();
-        }
         // 临时脚本不留垃圾；`--keep-script` 时保留，方便 `sudo bpftrace <file>` 手工复现。
+        // 子进程的收尾由 `LineChild` 自己的 `Drop` 负责。
         if self.keep_script {
             if let Some(p) = &self.script_path {
                 eprintln!("agtrace: kept script {}", p.display());
@@ -327,44 +211,6 @@ impl Drop for BpftraceCollector {
             let _ = std::fs::remove_file(p);
         }
     }
-}
-
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// 从一行 stderr 里提取丢包数。认两种形态：
-/// - bpftrace 的文本警告：`Lost 142 events`
-/// - JSON 信封：`{"type": "lost_events", "data": {"lost": 142}}`（`[不确定]`，见 §5.4 #2）
-fn parse_lost(line: &str) -> Option<u64> {
-    let l = line.to_ascii_lowercase();
-    if let Some(pos) = l.find("lost") {
-        // 取 "lost" 之后第一个连续数字。
-        let rest = &line[pos..];
-        let mut num = String::new();
-        let mut started = false;
-        for c in rest.chars() {
-            if c.is_ascii_digit() {
-                num.push(c);
-                started = true;
-            } else if started {
-                break;
-            }
-        }
-        if let Ok(v) = num.parse::<u64>() {
-            return Some(v);
-        }
-    }
-    None
 }
 
 /// `--source` 过滤（§4.1：逗号分隔 exec,file,net,agent）。
@@ -568,27 +414,55 @@ pub fn scan_descendants(root: u32) -> Vec<u32> {
 ///
 /// `name_to_handle_at(AT_FDCWD, <cgroup_path>, ...)` 返回的 kernfs handle
 /// **前 8 字节按小端解释**就等于 bpftrace 的 `cgroup` 值（根 cgroup 两者都是 1）。
+///
+/// 这也正是 eBPF 侧 `bpf_get_current_cgroup_id()` 的返回值（`cgrp->kn->id`），
+/// 两条路径算出来的 id 因此可以直接比对。
 pub fn cgroup_path_to_id(path: &str) -> Result<u64, String> {
     use std::ffi::CString;
     let c = CString::new(path).map_err(|_| "cgroup path contains NUL".to_string())?;
-    // struct file_handle 是变长结构：前 4 字节 handle_bytes，第 5 字节是句柄本体。
-    let mut buf = vec![0u8; 8 + 64];
+
+    // struct file_handle 是变长结构：`u32 handle_bytes` + `int handle_type` +
+    // 句柄本体，本体从第 8 字节开始。
+    //
+    // `handle_bytes` 是**入参**：调用前必须写明缓冲区装得下多少字节，内核才知道
+    // 填不填得下。留 0（`vec![0u8; ..]` 的默认值）时，内核对**任何**路径都返回
+    // EOVERFLOW——它把需要的长度写回 handle_bytes 就退出。于是 `-C` 在每台机器、
+    // 每个 cgroup 上都直接报 "Value too large for defined data type"，而错误信息
+    // 读起来完全像内核的毛病。（这个 bug 在 aya/bpftrace 两条路径上都存在：换算
+    // 发生在选 collector 之前，所以两边报的是同一句话。）
+    //
+    // 句柄长度随文件系统而异（kernfs 8 字节，ext4/xfs 可达 128），所以先给一个
+    // 够用的猜测，内核嫌小就按它回报的长度重试一次，而不是写死一个尺寸。
+    let mut handle_len = 64usize;
+    let mut buf = vec![0u8; 8 + handle_len];
     let mut mount_id: libc::c_int = 0;
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_name_to_handle_at,
-            libc::AT_FDCWD,
-            c.as_ptr(),
-            buf.as_mut_ptr() as *mut libc::c_void,
-            &mut mount_id as *mut libc::c_int,
-            0,
-        )
-    };
-    if rc != 0 {
+    loop {
+        buf[..4].copy_from_slice(&(handle_len as u32).to_ne_bytes());
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_name_to_handle_at,
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut mount_id as *mut libc::c_int,
+                0,
+            )
+        };
+        if rc == 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        let need = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        // EOVERFLOW 的意思是"缓冲区不够"，需要的长度就在 handle_bytes 里。
+        // 上界 4096 只是不给一个荒谬的返回值分配内存；每轮都会严格变大，必然收敛。
+        if err.raw_os_error() == Some(libc::EOVERFLOW) && need > handle_len && need <= 4096 {
+            handle_len = need;
+            buf = vec![0u8; 8 + handle_len];
+            continue;
+        }
         return Err(format!(
             "name_to_handle_at({}) failed: {}",
-            path,
-            io::Error::last_os_error()
+            path, err
         ));
     }
     let handle_bytes = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -606,6 +480,29 @@ pub fn cgroup_path_to_id(path: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_probe_always_explains_itself() {
+        // The point of `precheck` is that a missing/broken bpftrace is *said out
+        // loud* instead of yielding an empty timeline. So the reason must survive
+        // the case where the probe printed nothing at all.
+        assert_eq!(
+            probe_failure(Some(1), "sudo: bpftrace: command not found\n"),
+            "sudo: bpftrace: command not found"
+        );
+        assert_eq!(
+            probe_failure(Some(1), "\n\n   sudo: a password is required   \n"),
+            "sudo: a password is required",
+            "leading blank lines must be skipped, not reported as the reason"
+        );
+        let silent = probe_failure(Some(127), "");
+        assert!(
+            silent.contains("127") && silent.contains("said nothing"),
+            "a silent probe still has to say something: {}",
+            silent
+        );
+        assert!(!probe_failure(None, "").is_empty());
+    }
 
     #[test]
     fn script_renders_without_placeholders() {
@@ -645,9 +542,37 @@ mod tests {
     }
 
     #[test]
+    fn the_root_cgroup_resolves_to_one() {
+        // `-C` 的唯一一个不需要预先准备就能问的 cgroup，也正是上面文档里承诺过的
+        // 那个值：根 cgroup 在 bpftrace 和 kernfs 里都是 1。
+        //
+        // 这个断言同时钉住了**协议**：`handle_bytes` 留 0 时内核对任何路径都返回
+        // EOVERFLOW，所以一旦回退到那个写法，这个测试在任何机器上都会失败——而
+        // 不是只在某台机器的某个 cgroup 上失败，这正是它当初没被发现的原因。
+        if !std::path::Path::new("/sys/fs/cgroup").exists() {
+            return; // cgroup v1 主机：没有统一层级，跳过
+        }
+        match cgroup_path_to_id("/sys/fs/cgroup") {
+            Ok(id) => assert_eq!(id, 1),
+            // 句柄长度是文件系统的性质，不是所有 fs 都支持 name_to_handle_at；
+            // 那种主机上换算本来就不可用，不该算测试失败。
+            Err(e) => assert!(
+                e.contains("not supported") || e.contains("Operation not permitted"),
+                "root cgroup must resolve to 1, got: {}",
+                e
+            ),
+        }
+    }
+
+    #[test]
     fn lost_line_parsing() {
-        assert_eq!(parse_lost("Lost 142 events"), Some(142));
-        assert_eq!(parse_lost("{\"type\": \"lost_events\", \"lost\": 7}"), Some(7));
-        assert_eq!(parse_lost("nothing here"), None);
+        // `parse_lost` 现在住在 child.rs（两个采集器共用），这里保留 bpftrace 侧的
+        // 回归断言：这是它当初为 bpftrace 写下的两种形态。
+        assert_eq!(super::super::child::parse_lost("Lost 142 events"), Some(142));
+        assert_eq!(
+            super::super::child::parse_lost("{\"type\": \"lost_events\", \"lost\": 7}"),
+            Some(7)
+        );
+        assert_eq!(super::super::child::parse_lost("nothing here"), None);
     }
 }

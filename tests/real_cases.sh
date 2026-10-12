@@ -19,12 +19,16 @@
 # Usage: tests/real_cases.sh [rc1|rc2|rc3|all] [--fast] [--verbose]
 #
 # --fast skips `window` (the only slow mode). Requires passwordless sudo for the
-# live modes, because kernel capture needs bpftrace.
+# live modes, because kernel capture needs root. Since v0.5 the kernel side is the
+# in-process aya loader, so the live modes exercise that path end to end; export
+# COLLECTOR=bpftrace to replay the same suite through the bpftrace fallback.
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 
 BIN=target/release/agtrace
+# Which kernel collector the live modes run through; see the note above.
+COLLECTOR=${COLLECTOR:-}
 DIR=tests/real_cases
 MARGIN=1.5 # seconds between a tool.call and its live exec (absorbs attach latency)
 
@@ -56,7 +60,7 @@ if [ ! -x "$BIN" ]; then
   exit 2
 fi
 
-# Kernel capture needs bpftrace, which needs root. Without passwordless sudo the
+# Kernel capture needs root. Without passwordless sudo the
 # live modes cannot run at all — skip them loudly rather than reporting a
 # failure the reader would misread as a binding regression.
 HAVE_SUDO=0
@@ -154,13 +158,15 @@ run_mode() {
 
   sleep 0.2
   # The watchdog must outlive --duration: at `timeout 60` the window case (whose
-  # only exec lands at ~130 s) lost bpftrace 70 s early and reported execs_seen=0.
+  # only exec lands at ~130 s) lost the collector 70 s early and reported
+  # execs_seen=0.
   local guard=$((last + 30))
   if [ "$mode" = "offline" ]; then
     # No kernel side at all: the adapter alone, no privileges needed.
     timeout "$guard" "$BIN" -S "$rebased" --output json --no-color >"$out" 2>"$out.err"
   else
     timeout "$guard" sudo -n "$BIN" -p "$root" -S "$rebased" --duration "$last" \
+      ${COLLECTOR:+--collector "$COLLECTOR"} \
       --output json --no-color >"$out" 2>"$out.err"
   fi
   note "root=$root duration=${last}s offsets=${o1}/${o2} line2=$line2"

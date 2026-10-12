@@ -8,6 +8,7 @@ mod binding;
 mod cli;
 mod collapse;
 mod collector;
+mod ebpf;
 mod event;
 mod exact;
 mod fail;
@@ -19,8 +20,10 @@ mod views;
 
 use cli::{Cli, OutputMode, Parsed};
 use collapse::{CollapseCfg, Collapser};
+use cli::CollectorBackend;
 use collector::Collector;
-use collector::bpftrace::{BpftraceCollector, SourceFilter, Target, scan_descendants};
+use collector::KernelCollector;
+use collector::bpftrace::{SourceFilter, Target, scan_descendants};
 use event::Binding;
 use fail::{FailAttributor, FailCfg};
 use merger::Merger;
@@ -44,6 +47,14 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 }
 
 fn main() {
+    // The privileged loader is this same binary re-executed under `sudo` (see
+    // `collector::aya`). It has to be intercepted *before* the CLI parser, which
+    // knows nothing about it, and it must never be reachable by accident: the
+    // name starts with `__` and no real option does.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some(collector::aya::SUBCOMMAND) {
+        std::process::exit(ebpf::loader_main(&argv[2..]));
+    }
     let code = run();
     std::process::exit(code);
 }
@@ -124,11 +135,12 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
 
     // ---------------- 内核采集器 ----------------
     let sources = cli.source.clone().unwrap_or_else(SourceFilter::all);
-    let mut collector: Option<BpftraceCollector> = None;
+    let mut collector: Option<KernelCollector> = None;
     let mut target_desc = String::new();
     // v0.2：这些进程在 attach 之前就已经 exec 完了，内核不会再把那次 exec 报给我们。
     // 但它们的 fork 行同样要回答"这是哪个 python？"，所以先把 /proc 里的命令行抄下来。
     let mut seed_pids: Vec<u32> = Vec::new();
+    let mut target: Option<Target> = None;
 
     if let Some(pid) = cli.pid {
         // 先确认进程真的存在 —— 否则 bpftrace 会安静地 attach 到空集合上，
@@ -142,36 +154,34 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         let seeds = scan_descendants(pid);
         seed_pids = seeds.clone();
         target_desc = format!("pid {} (tree, {} initial members)", pid, seeds.len());
-        let target = Target::PidTree { root: pid, seeds };
-        let c = BpftraceCollector::spawn(
-            BPF_TEMPLATE,
-            &target,
-            cli.argv_max,
-            cli.file_all,
-            &sources,
-            cli.redact,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-        collector = Some(c);
+        target = Some(Target::PidTree { root: pid, seeds });
     } else if let Some(path) = &cli.cgroup {
         let id = collector::bpftrace::cgroup_path_to_id(path)?;
         target_desc = format!("cgroup {} (id {})", path, id);
-        let target = Target::Cgroup { path: path.clone(), id };
-        let c = BpftraceCollector::spawn(
-            BPF_TEMPLATE,
-            &target,
+        target = Some(Target::Cgroup { path: path.clone(), id });
+    }
+
+    if let Some(target) = &target {
+        // One spawn path for both backends: the choice, and the *visible* note when
+        // the preferred one is unavailable, belong in one place. A silent fallback
+        // would make "why did this take 3 seconds" and "why does -v say bpftrace"
+        // unanswerable, and would let a broken aya build go unnoticed for months.
+        let (c, note) = collector::aya::spawn_with_fallback(
+            cli.collector == CollectorBackend::Aya,
+            target,
             cli.argv_max,
             cli.file_all,
             &sources,
             cli.redact,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+            BPF_TEMPLATE,
+        )?;
+        if let Some(note) = note {
+            eprintln!("agtrace: note — {}", note);
+        }
         collector = Some(c);
     }
     if let Some(c) = collector.as_mut() {
-        c.keep_script = cli.keep_script;
+        c.set_keep_script(cli.keep_script);
     }
 
     // ---------------- v0.2 折叠器 ----------------
@@ -217,9 +227,15 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     // 折成两行是为了守住"默认输出不超过 120 列"这条：这条注记和事件行一样会落到
     // 用户的终端里，一个照 120 列摆的窗口不该被它顶出折行。
     if collector.is_some() && !cli.follow {
+        let backend = if collector.as_ref().is_some_and(|c| c.is_aya()) {
+            "aya"
+        } else {
+            "bpftrace"
+        };
         eprintln!(
-            "agtrace: note — kernel capture (bpftrace) has no natural end.\n\
-             agtrace: without -f, bound the run with --duration or --max-events."
+            "agtrace: note — kernel capture ({}) has no natural end.\n\
+             agtrace: without -f, bound the run with --duration or --max-events.",
+            backend
         );
     }
 
@@ -732,7 +748,7 @@ fn print_diagnostics(
     cli: &Cli,
     summary: &Summary,
     merger: &Merger,
-    collector: Option<&BpftraceCollector>,
+    collector: Option<&KernelCollector>,
     adapters: &[Box<dyn adapter::EventAdapter>],
     bind: &binding::BindingResult,
     cs: collapse::CollapseStats,
@@ -834,9 +850,11 @@ fn print_diagnostics(
     }
     if let Some(c) = collector {
         let s = c.parse_stats();
-        eprintln!("  collector: {}", Collector::id(c));
+        let id = Collector::id(c);
+        eprintln!("  collector: {}", id);
         eprintln!(
-            "  bpftrace: lines {} / unknown tag {} / malformed {} / non-protocol {} / argv orphans {} / lost {}",
+            "  {}: lines {} / unknown tag {} / malformed {} / non-protocol {} / argv orphans {} / lost {}",
+            id,
             s.lines_total,
             s.lines_unknown_tag,
             s.lines_malformed,
@@ -847,7 +865,7 @@ fn print_diagnostics(
         // 脚本指纹：bpftrace 是把脚本拷到临时文件后加载的，"我渲染的脚本"和
         // "实际跑的脚本"是两件事。给出字节数 + 行数 + FNV-1a 摘要，用户拿它就能
         // 确认 -p 的过滤器真的被替换进去了（配合 --keep-script 可逐字节比对）。
-        let script = &c.rendered_script;
+        let script = c.rendered_script();
         eprintln!(
             "  script: {} bytes / {} lines / fnv1a={:016x}; argv masked in {} event(s)",
             script.len(),
@@ -855,9 +873,24 @@ fn print_diagnostics(
             fnv1a(script.as_bytes()),
             c.redacted_events()
         );
-        if !c.stderr_tail.is_empty() {
-            eprintln!("  bpftrace stderr (last {} lines):", c.stderr_tail.len());
-            for l in c.stderr_tail.iter().take(20) {
+        // When the run fell back, the note went to stderr at startup and may be
+        // long gone from the scrollback. Naming both the requested and the actual
+        // backend here is what makes "why is -v showing bpftrace" answerable after
+        // the fact.
+        if cli.collector.as_str() != id {
+            eprintln!(
+                "  requested --collector {}; ran {} instead (see the note above and stderr below)",
+                cli.collector.as_str(),
+                id
+            );
+        }
+        if let Some(code) = c.exit_code() {
+            eprintln!("  collector exit status: {}", code);
+        }
+        let tail = c.stderr_tail();
+        if !tail.is_empty() {
+            eprintln!("  {} stderr (last {} lines):", id, tail.len());
+            for l in tail.iter().take(20) {
                 eprintln!("    {}", l);
             }
         }
