@@ -311,7 +311,10 @@ pub fn payload_line(ev: &Event, budget: usize) -> String {
                 format!("connect {}  {} failed", target, family_name)
             }
         }
-        Payload::NetSendto { fd, len } => format!("sendto fd={} len={}", fd, len),
+        Payload::NetSendto { fd, len, peer } => match peer {
+            Some(p) => format!("sendto fd={} len={} -> {}", fd, len, p),
+            None => format!("sendto fd={} len={}", fd, len),
+        },
         Payload::PolicyDeny {
             syscall,
             target,

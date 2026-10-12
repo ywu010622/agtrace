@@ -151,7 +151,7 @@ fn default_watchlist() -> Vec<WatchRule> {
 ///
 /// 刻意不做 `?` / `[]` / `**` —— 规则表达式越复杂，用户越难预测它匹配什么，
 /// 而"我能预测它在匹配什么"是安全工具的基本要求。
-fn glob_match(pat: &str, s: &str) -> bool {
+pub(crate) fn glob_match(pat: &str, s: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = s.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -612,7 +612,12 @@ impl Views {
                 for (i, r) in self.cfg.watch.iter().enumerate() {
                     match r.kind {
                         WatchKind::Bash if is_bash => {
-                            if glob_match(&r.pattern, cmd) {
+                            // segment-aware：按子命令逐条匹配，`*` 不能横跨 `;`/`&&`/`||`
+                            // 把不相干的子命令拼成"证据"（2026-10-11 误报教训）。
+                            if crate::exact::split_commands(cmd)
+                                .iter()
+                                .any(|seg| glob_match(&r.pattern, seg))
+                            {
                                 hits.push((i, crate::event::truncate_chars(cmd, 120, 120).0));
                             }
                         }

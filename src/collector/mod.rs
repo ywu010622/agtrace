@@ -50,12 +50,43 @@ pub struct ParseStats {
     pub lines_non_protocol: u64,
     pub ticks: u64,
     pub argv_orphans: u64,
+    /// v0.4.2：默认模式下被丢弃的非敏感只读 open（内核已放行，Rust 侧过滤）。
+    pub files_dropped_default: u64,
 }
 
 /// 内核行协议解析器。
 ///
 /// 关键点：**每行最后一个字段是唯一可能包含 `|` 的字段**，所以一律用 `splitn`，
 /// 保证尾字段原样保留。这是把 argv / 路径（可能含 `|`）安全送达 Rust 侧的前提。
+/// v0.4.2：默认模式下，只读 open 命中这些路径才保留。
+/// 与 views.rs `default_watchlist` 的 File 规则保持一致 —— 改动时两处同步。
+const SENSITIVE_FILE_PATTERNS: &[&str] = &[
+    "*/.ssh/id_*",
+    "*/id_rsa",
+    "*/id_ed25519",
+    "*/.aws/credentials",
+    "*/gcloud/credentials.db",
+    "*/.kube/config",
+    "*/.netrc",
+    "*/.env",
+    "/etc/shadow",
+    "/etc/sudoers*",
+    "*/.docker/config.json",
+    "*/.npmrc",
+    "*/.git-credentials",
+    "/proc/*/environ",
+];
+
+/// 敏感路径判断。只对绝对路径做判断；相对路径无法还原（§5.2 #2），不猜。
+fn is_sensitive_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    SENSITIVE_FILE_PATTERNS
+        .iter()
+        .any(|p| crate::views::glob_match(p, path))
+}
+
 pub struct KernelLineParser {
     /// bpftrace `str()` 的字节上限（由 `BPFTRACE_MAX_STRLEN` 决定），用于判定截断。
     str_limit: usize,
@@ -69,6 +100,13 @@ pub struct KernelLineParser {
     pending: Option<PendingExec>,
     /// 上一个事件产出后，Rust 侧分配 seq 的起始值（merger 会重写）。
     next_seq: u64,
+    /// v0.4.2：(pid, fd) → (addr, port)，由 connect 事件填充，供 sendto 做
+    /// 对端归因。fd 会被复用，这是 most-recent 启发式，不是因果保证。
+    fd_peer: std::collections::HashMap<(u32, i64), (String, Option<u16>)>,
+    /// v0.4.2：--file-all 是否开启。关闭时，只读 open 只有敏感路径才保留
+    /// （内核侧默认已放行全部 open，过滤在 Rust 侧做 —— bpftrace 里做字符串
+    /// 匹配不现实）。
+    file_all: bool,
 }
 
 struct PendingExec {
@@ -91,7 +129,14 @@ impl KernelLineParser {
             stats: ParseStats::default(),
             pending: None,
             next_seq: 0,
+            fd_peer: std::collections::HashMap::new(),
+            file_all: false,
         }
+    }
+
+    /// 设置 --file-all（BpftraceCollector::spawn 调用）。
+    pub fn set_file_all(&mut self, v: bool) {
+        self.file_all = v;
     }
 
     /// 取下一个 seq。
@@ -415,6 +460,16 @@ impl KernelLineParser {
         // §5.2 #2：相对路径无法还原成绝对路径 —— 只标记，**不猜**。
         let path_is_relative = !path.starts_with('/') && dirfd != libc::AT_FDCWD as i64;
 
+        // v0.4.2：默认模式下，只读 open 只有敏感路径才保留（写意图的一律保留）。
+        // 内核侧默认已放行全部 open（--file-all 的语义不变：全部保留），过滤在这里做。
+        if !self.file_all {
+            let write_intent = flags & (0x1 | 0x2 | 0x40 | 0x200 | 0x400) != 0;
+            if !write_intent && !is_sensitive_path(&path) {
+                self.stats.files_dropped_default += 1;
+                return;
+            }
+        }
+
         let ev = Event {
             seq: self.seq(),
             ts_ns,
@@ -517,6 +572,14 @@ impl KernelLineParser {
             retry: false,
         };
 
+        // v0.4.2：记录 (pid, fd) → 对端，供后续 sendto 归因。
+        // fd 会被复用，这是 most-recent 启发式；UDP 无连接则无记录。
+        if let (Some(pid), Some(fd)) = (f[2].parse::<u32>().ok(), f[6].parse::<i64>().ok()) {
+            if !addr.is_empty() {
+                let port_opt = if family == 2 || family == 10 { Some(port) } else { None };
+                self.fd_peer.insert((pid, fd), (addr.clone(), port_opt));
+            }
+        }
         // connect 失败 → policy.deny（§2.2 Group D）。
         //
         // §1.2 把 policy.deny 的判定条件写死为 `retval ∈ {EACCES=-13, EPERM=-1}` ——
@@ -575,6 +638,16 @@ impl KernelLineParser {
             payload: Payload::NetSendto {
                 fd: f[6].parse().unwrap_or(-1),
                 len: f[7].parse().unwrap_or(0),
+                peer: {
+                    let pid: Option<u32> = f[2].parse().ok();
+                    let fd: i64 = f[6].parse().unwrap_or(-1);
+                    pid.and_then(|p| self.fd_peer.get(&(p, fd))).map(|(a, port)| {
+                        match port {
+                            Some(pt) => format!("{}:{}", a, pt),
+                            None => a.clone(),
+                        }
+                    })
+                },
             },
             trunc: Vec::new(),
             notes: Vec::new(),
@@ -739,6 +812,116 @@ fn decode_lossy(b: &[u8]) -> String {
 /// 极小的 memchr，避免为这一个用途引入依赖。
 fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
     hay.iter().position(|&b| b == needle)
+}
+
+#[cfg(test)]
+mod sensitive_read_tests {
+    use super::*;
+    use crate::event::Kind;
+
+    fn feed(p: &mut KernelLineParser, line: &str) -> Vec<Event> {
+        let mut out = Vec::new();
+        p.feed_line(line, &mut out);
+        out
+    }
+
+    // OPEN|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<flags_hex>|<dirfd>|<ret>|<path>
+    // flags: 0 = O_RDONLY, 1 = O_WRONLY
+
+    #[test]
+    fn default_keeps_sensitive_readonly_open() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        // file_all defaults to false
+        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|-100|3|/etc/shadow");
+        assert!(evs.iter().any(|e| e.kind == Kind::InfraFileOpen));
+        assert_eq!(p.stats.files_dropped_default, 0);
+    }
+
+    #[test]
+    fn default_drops_benign_readonly_open() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|-100|3|/usr/lib/locale/en_US/LC_MESSAGES");
+        assert!(evs.is_empty());
+        assert_eq!(p.stats.files_dropped_default, 1);
+    }
+
+    #[test]
+    fn default_keeps_write_intent_open() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|/tmp/out.txt");
+        assert!(evs.iter().any(|e| e.kind == Kind::InfraFileOpen));
+    }
+
+    #[test]
+    fn file_all_keeps_everything() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        p.set_file_all(true);
+        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|-100|3|/usr/lib/locale/en_US/LC_MESSAGES");
+        assert!(evs.iter().any(|e| e.kind == Kind::InfraFileOpen));
+        assert_eq!(p.stats.files_dropped_default, 0);
+    }
+
+    #[test]
+    fn relative_sensitive_path_not_guessed() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        // relative path: cannot resolve, do not guess (§5.2 #2)
+        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|42|3|shadow");
+        assert!(evs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fd_peer_tests {
+    use super::*;
+    use crate::event::Kind;
+
+    fn feed(p: &mut KernelLineParser, line: &str) -> Vec<Event> {
+        let mut out = Vec::new();
+        p.feed_line(line, &mut out);
+        out
+    }
+
+    #[test]
+    fn sendto_shows_peer_from_earlier_connect() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        // CONN|<nsecs>|<pid>|<tid>|<ppid>|<cgroup>|<fd>|<family>|<port>|<ret>|<addr>
+        let evs = feed(&mut p, "CONN|1000|1234|1234|1|5|7|2|9876|0|127.0.0.1");
+        assert!(evs.iter().any(|e| e.kind == Kind::InfraNetConnect));
+        let evs = feed(&mut p, "SEND|2000|1234|1234|1|5|7|1");
+        let send = evs.iter().find(|e| e.kind == Kind::InfraNetSendto).unwrap();
+        match &send.payload {
+            crate::event::Payload::NetSendto { peer, .. } => {
+                assert_eq!(peer.as_deref(), Some("127.0.0.1:9876"))
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sendto_without_connect_has_no_peer() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        let evs = feed(&mut p, "SEND|2000|9999|9999|1|5|9|64");
+        let send = evs.iter().find(|e| e.kind == Kind::InfraNetSendto).unwrap();
+        match &send.payload {
+            crate::event::Payload::NetSendto { peer, .. } => assert_eq!(peer, &None),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fd_reuse_takes_most_recent_connect() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        feed(&mut p, "CONN|1000|1234|1234|1|5|7|2|1111|0|10.0.0.1");
+        feed(&mut p, "CONN|1500|1234|1234|1|5|7|2|2222|0|10.0.0.2");
+        let evs = feed(&mut p, "SEND|2000|1234|1234|1|5|7|1");
+        let send = evs.iter().find(|e| e.kind == Kind::InfraNetSendto).unwrap();
+        match &send.payload {
+            crate::event::Payload::NetSendto { peer, .. } => {
+                assert_eq!(peer.as_deref(), Some("10.0.0.2:2222"))
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
 }
 
 #[cfg(test)]

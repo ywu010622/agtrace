@@ -130,7 +130,11 @@ impl BpftraceCollector {
             child,
             stdout_fd,
             stderr_fd,
-            parser: KernelLineParser::with_redact(MAX_STRLEN, redact),
+            parser: {
+                let mut p = KernelLineParser::with_redact(MAX_STRLEN, redact);
+                p.set_file_all(file_all);
+                p
+            },
             out_buf: LineBuffer::new(),
             err_buf: LineBuffer::new(),
             lost: 0,
@@ -481,11 +485,10 @@ pub fn render_script(
 
     // --- openat 写意图过滤（§2.2：不过滤会被 openat 淹没）---
     // O_WRONLY=1 O_RDWR=2 O_CREAT=0x40 O_TRUNC=0x200 O_APPEND=0x400
-    let file_pred = if file_all {
-        "1".to_string()
-    } else {
-        "(args->flags & 1) || (args->flags & 2) || (args->flags & 0x40) || (args->flags & 0x200) || (args->flags & 0x400)".to_string()
-    };
+    // v0.4.2：内核侧默认放行全部 open，写意图/敏感路径的过滤移到 Rust 侧
+    // （KernelLineParser::handle_open）—— bpftrace 里做字符串匹配不现实。
+    // --file-all 的语义不变：Rust 侧不过滤。
+    let file_pred = "1".to_string();
 
     let tpl = template
         .replacen("@@SEEDS@@", &seeds.trim_end_matches('\n'), 1)

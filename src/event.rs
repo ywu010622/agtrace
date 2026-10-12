@@ -467,6 +467,11 @@ pub enum Payload {
     NetSendto {
         fd: i64,
         len: u64,
+        /// v0.4.2：该 fd 最近一次 connect 的对端（`addr` 或 `addr:port`）。
+        /// fd 号会被复用，所以这是启发式归因（most-recent connect），不是因果保证；
+        /// UDP 等无连接的 sendto 没有 connect 事件，peer 为 None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
     },
 
     // ---- policy ----

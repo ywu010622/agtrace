@@ -175,7 +175,7 @@ Fidelity / privacy:
                            argv masks credential-shaped command-line arguments as ***,
                            but leaves agent prompt/thinking/tool text unmasked
                            (pass argv+content to mask that too).
-      --file-all           log every openat (default: write intent only)
+      --file-all           log every openat (default: write intent + sensitive-path reads)
       --argv-max <N>       max argv entries captured                  (default {am})
       --tool-arg-max <N>   truncate tool_use input                    (default {ta})
       --bash-cmd-max <N>   truncate Bash command                      (default {bc})
