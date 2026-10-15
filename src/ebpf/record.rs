@@ -202,7 +202,22 @@ pub fn tick_line(ts_ns: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agtrace_ebpf_common::MAX_STRS;
+    use agtrace_ebpf_common::{MAX_STRS, RAW_MAGIC};
+
+    /// 记录布局变化有两种，各有各的岗哨：**改大小**由 loader 的
+    /// `data.len() != rec_size` 拦下，**同宽字段挪位**（大小不变）由记录里的
+    /// `RAW_MAGIC` 拦下。两者都要求"改布局就改哨兵版本位"，所以这里把大小钉死：
+    /// 动布局的人会先撞到这一条，而不是撞到用户那边的一条静默错行的时间线。
+    #[test]
+    fn record_size_is_pinned_alongside_the_magic() {
+        assert_eq!(
+            std::mem::size_of::<RawEvent>(),
+            1248,
+            "布局改了：请一并改 agtrace-ebpf-common 的 RAW_MAGIC 版本位，并同步这条断言"
+        );
+        let fresh: RawEvent = unsafe { std::mem::zeroed() };
+        assert_ne!(fresh.magic, RAW_MAGIC, "清零的记录不得碰巧带上哨兵");
+    }
 
     fn rec(kind: u32) -> RawEvent {
         let mut r: RawEvent = unsafe { std::mem::zeroed() };

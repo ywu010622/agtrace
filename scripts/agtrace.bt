@@ -82,13 +82,18 @@ tracepoint:sched:sched_process_fork
 tracepoint:sched:sched_process_exit
 /@@FILTER@@/
 {
-    if (@@SRC_EXEC@@) {
+    // 只在最后一个线程退出（进程真正死亡）时产出 EXIT：per-thread 发射会
+    // 把多线程 target 的线程退出误报成进程退出（与 aya 侧 on_exit 一致）。
+    if (@@SRC_EXEC@@ && args->group_dead) {
         printf("EXIT|%llu|%d|%d|%llu|%d|%s\n",
                nsecs, pid, curtask->real_parent->pid, cgroup,
                curtask->exit_code >> 8, comm);
     }
-    // 树成员退出即移除，避免 map 无界增长（pid 复用风险 v0 接受，见 §5.2）
-    delete(@in_tree[pid]);
+    // 只有最后一个线程退出才移除：per-thread 移除会把多线程 target 静默
+    // 踢出 filter（pid 复用风险 v0 接受，见 §5.2）。
+    if (args->group_dead) {
+        delete(@in_tree[pid]);
+    }
 }
 
 // ===========================================================================

@@ -171,6 +171,15 @@ pub enum Kind {
     /// tool.call 到流结束都没等到 tool.result。
     #[serde(rename = "derived.tool.dangling")]
     DerivedToolDangling,
+    /// v0.6 §10.3：**楔形** —— Bash 报成功，但整段运行的内核里没有对应的
+    /// `net.connect`。
+    ///
+    /// 单独一个 kind，而不是借用 `derived.tool.gap`：gap 是**时间**上的异常
+    /// （这一调用跑了很久），楔形是**因果**上的矛盾（执行层说做了，内核说没发生）。
+    /// 两者混在一个 kind 里，`--output json` 的消费者按 `kind` 过滤时会把
+    /// "慢"和"对不上账"当成同一件事 —— 而后者才是这个工具存在的理由。
+    #[serde(rename = "derived.tool.wedge")]
+    DerivedToolWedge,
     /// watchlist 命中（§8 ⑤），alert-only。
     #[serde(rename = "derived.watchlist")]
     DerivedWatchlist,
@@ -243,6 +252,7 @@ impl Kind {
             Kind::DerivedToolGap => "derived.tool.gap",
             Kind::DerivedToolRetry => "derived.tool.retry",
             Kind::DerivedToolDangling => "derived.tool.dangling",
+            Kind::DerivedToolWedge => "derived.tool.wedge",
             Kind::DerivedWatchlist => "derived.watchlist",
             Kind::DerivedExecvp => "derived.execvp",
             Kind::DerivedForkBurst => "derived.fork_burst",

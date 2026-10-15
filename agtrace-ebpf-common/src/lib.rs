@@ -143,7 +143,11 @@ pub struct RawEvent {
     pub tid: u32,
     /// Parent thread-group id, sourced from the `PARENT_OF` map.
     pub ppid: u32,
-    pub _pad: u32,
+    /// ABI 哨兵；见 [`RAW_MAGIC`]。
+    ///
+    /// 这个位置本来就是对齐用的填充（4 字节），拿它当哨兵是**零代价**的：
+    /// 结构体大小不变，两侧的内存布局也不变，内核侧只多一条 store。
+    pub magic: u32,
     pub cgroup: u64,
     /// Kind-specific numbers; see the loader's `format_record`.
     pub n0: i64,
@@ -210,6 +214,17 @@ impl RawEvent {
         if trunc { n | LEN_TRUNC } else { n }
     }
 }
+
+/// [`RawEvent::magic`] 的取值：`AGT` + 版本低 8 位。
+///
+/// 内核侧和用户态各自从同一份 crate 编译，所以**正常情况下**布局一定一致。
+/// 这个哨兵防的是"不一致却看不出来"：环缓冲里的记录是按内核那份结构体
+/// `reserve` 出来的，用户态再按自己这份解释。两者大小不同时已有长度检查兜底
+///（见 loader 的 `skipped`），但**大小相同而字段挪了位置**（重排、互换两个
+/// 同宽字段）是静默的 —— 那条路只能靠一个显式写在记录里的常量堵上。
+///
+/// 改布局就改这个数：让陈旧的内核对象自己撞死，而不是把字段读成别的意思。
+pub const RAW_MAGIC: u32 = 0x4147_5401; // "AGT" | 版本 1
 
 /// Payload-length bits of a [`RawEvent::lens`] slot.
 pub const LEN_MASK: u8 = 0x7f;

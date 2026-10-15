@@ -17,6 +17,36 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 
+/// 白名单：子进程真的需要的那几个环境变量。见 [`scrub_env`]。
+const KEEP_ENV: &[&str] = &["PATH", "RUST_BACKTRACE"];
+
+/// 特权子进程只继承它**真的需要**的环境变量。
+///
+/// 从用户 shell 到 `sudo`（再往下到 root 的 bpftrace / loader）是一条信任边界，
+/// 而用户会话的环境里躺着 API token、各类 `*_KEY`。`sudo` 默认 `env_reset` 会
+/// 把这些清掉 —— 但那是 **sudoers 里的策略**，用户可以关掉（`!env_reset`、
+/// `env_keep+=`），一个做安全调查的工具不该把自己的行为押在别人的 sudoers 上。
+/// 调用方本来就按 `-n` 非交互跑，这里再显式清一次，边界就摆在代码里而不是配置里。
+///
+/// 白名单只有两项，都是子进程自己的运行条件：
+/// - `PATH`：`sudo` / `bpftrace` 是按名字找的，而 `Command` 在环境被改过之后
+///   是按**子进程**的 `PATH` 找程序 —— 顺手也保住用户在 /usr/local 之类地方的
+///   自定义安装；
+/// - `RUST_BACKTRACE`：loader 崩了之后还得看得懂栈。
+///
+/// 调用点在构造 `Command` 的**最前面**：调用方随后 `.env(...)` 设的变量
+///（比如 bpftrace 的 `BPFTRACE_MAX_STRLEN`）不该被这里抹掉。
+pub fn scrub_env(cmd: &mut Command) {
+    let saved: Vec<(&str, std::ffi::OsString)> = KEEP_ENV
+        .iter()
+        .filter_map(|k| std::env::var_os(k).map(|v| (*k, v)))
+        .collect();
+    cmd.env_clear();
+    for (k, v) in saved {
+        cmd.env(k, v);
+    }
+}
+
 /// A spawned child whose stdout is the kernel line protocol.
 pub struct LineChild {
     child: Child,
@@ -324,5 +354,46 @@ mod tests {
         // "we do not know how many" must never be reported as "none were lost".
         assert_eq!(parse_lost("attaching 10 probes..."), None);
         assert_eq!(parse_lost("lost events?"), None);
+    }
+
+    /// 子进程实际拿到的环境：只有白名单，父进程继承来的一个都不剩。
+    /// 用真跑一个 `env` 来验，而不是读 `Command` 内部状态 —— 后者看不到
+    /// "环境被清空"这件事，只能看到后来显式设了哪些。
+    #[test]
+    fn scrub_env_leaves_the_child_only_the_allowlist() {
+        // 这条测试只有在父进程环境**确实比白名单丰富**时才有意义（cargo test
+        // 会注入 CARGO_* / HOME 等）；否则它只是空转。
+        assert!(
+            std::env::vars_os().count() > KEEP_ENV.len(),
+            "父进程环境太少，这条测试证明不了什么"
+        );
+        let mut cmd = Command::new("/usr/bin/env");
+        scrub_env(&mut cmd);
+        let out = cmd.output().expect("/usr/bin/env 必须存在");
+        let keys: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split('=').next().map(|s| s.to_string()))
+            .collect();
+        for k in &keys {
+            assert!(KEEP_ENV.contains(&k.as_str()), "子进程继承了 {:?}（全部：{:?}）", k, keys);
+        }
+    }
+
+    /// 白名单是**先清后设**：调用方随后 `.env(...)` 的变量必须活下来
+    ///（bpftrace 的 `BPFTRACE_MAX_STRLEN` 就是靠这个顺序活着的）。
+    #[test]
+    fn a_callers_own_env_survives_the_scrub() {
+        let mut cmd = Command::new("sudo");
+        scrub_env(&mut cmd);
+        cmd.env("BPFTRACE_MAX_STRLEN", "200");
+        let explicit: Vec<String> = cmd
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            explicit.iter().any(|k| k == "BPFTRACE_MAX_STRLEN"),
+            "调用方设的变量被抹掉了: {:?}",
+            explicit
+        );
     }
 }

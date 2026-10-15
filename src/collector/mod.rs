@@ -565,6 +565,13 @@ impl KernelLineParser {
             self.stats.lines_malformed += 1;
             return;
         };
+        // 进程没了，它的 fd 也就没了：`fd_peer` 里属于这个 pid 的记录全部回收。
+        // 不回收就是只增不减 —— `close` 不在追踪范围内（§2.2），唯一的生命周期
+        // 信号就是这一行。顺带堵掉 pid 复用：新进程不该继承上一个同号进程的对端。
+        let pid: Option<u32> = f[2].parse().ok();
+        if let Some(pid) = pid {
+            self.fd_peer.retain(|&(p, _), _| p != pid);
+        }
         let mut trunc = Vec::new();
         out.push(Event {
             seq: self.seq(),
@@ -574,7 +581,7 @@ impl KernelLineParser {
             layer: Layer::Runtime,
             kind: Kind::RuntimeProcExit,
             source: self.source_label.into(),
-            pid: f[2].parse().ok(),
+            pid,
             tid: None,
             ppid: f[3].parse().ok(),
             comm: Some(clean_str(f[6], self.str_limit, "comm", &mut trunc)),
@@ -878,13 +885,17 @@ fn check_str_trunc(s: &str, limit: usize) -> Option<TruncNote> {
 }
 
 /// 清洗一个可能被截断的字符串字段。
+///
+/// 两条分支都过 `one_line`：被截断的那条**尤其**需要 —— 截断与否和"里面有没有
+/// 控制字符"是两件无关的事，一个超长路径照样可以把 `\r` / `\x1b` 带进来。
+/// 原来这里直接 `to_string()`，于是 `..` 成了绕过转义的唯一姿势。
 fn clean_str(s: &str, limit: usize, field: &str, trunc: &mut Vec<TruncNote>) -> String {
     if s.ends_with(TRUNC_MARK) {
         trunc.push(TruncNote::new(field, None, limit).with_note(format!(
             "truncated at the kernel-side str() cap of {} bytes (original length unknown)",
             limit
         )));
-        s.trim_end_matches(TRUNC_MARK).to_string()
+        one_line(s.trim_end_matches(TRUNC_MARK))
     } else {
         one_line(s)
     }
@@ -1014,6 +1025,25 @@ mod sensitive_read_tests {
         assert_eq!(p.stats.files_dropped_default, 0);
     }
 
+    /// 被内核截断的路径（以 `..` 收尾）照样要过 `one_line`：截断与"里面有没有
+    /// 控制字符"无关，而 `..` 曾经是绕过转义的唯一姿势（§3.2 只允许单行 payload）。
+    #[test]
+    fn truncated_path_is_still_control_escaped() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        // flags=1（写意图），否则这条只读 open 会被默认过滤掉。
+        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|/tmp/ev\x1b[31m..");
+        let ev = evs.iter().find(|e| e.kind == Kind::InfraFileOpen).unwrap();
+        match &ev.payload {
+            crate::event::Payload::FileOpen { path, .. } => {
+                assert!(!path.contains('\x1b'), "控制字符必须转义: {:?}", path);
+                assert!(path.contains("\\x1b"), "转义要看得见: {:?}", path);
+                assert!(path.ends_with("[31m"), "`..` 仍要摘掉: {:?}", path);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+        assert!(!ev.trunc.is_empty(), "截断必须留痕");
+    }
+
     #[test]
     fn relative_sensitive_path_not_guessed() {
         let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
@@ -1054,6 +1084,27 @@ mod fd_peer_tests {
     fn sendto_without_connect_has_no_peer() {
         let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
         let evs = feed(&mut p, "SEND|2000|9999|9999|1|5|9|64");
+        let send = evs.iter().find(|e| e.kind == Kind::InfraNetSendto).unwrap();
+        match &send.payload {
+            crate::event::Payload::NetSendto { peer, .. } => assert_eq!(peer, &None),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// 进程退出 = 它的 (pid, fd) 记录全部作废。表只增不减就是内存泄漏，
+    /// 而 pid 复用还会让新进程的 sendto 认错对端。
+    #[test]
+    fn exit_evicts_that_pids_peer_entries() {
+        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        feed(&mut p, "CONN|1000|1234|1234|1|5|7|2|1111|0|10.0.0.1");
+        feed(&mut p, "CONN|1000|9999|9999|1|5|7|2|2222|0|10.0.0.2");
+        assert_eq!(p.fd_peer.len(), 2);
+        // EXIT|<nsecs>|<pid>|<ppid>|<cgroup>|<exit_code>|<comm>
+        let evs = feed(&mut p, "EXIT|2000|1234|1|5|0|curl");
+        assert!(evs.iter().any(|e| e.kind == Kind::RuntimeProcExit));
+        assert_eq!(p.fd_peer.len(), 1, "退出进程的记录必须回收，别人的要留下");
+        // 退出之后这个 pid 的 sendto 不该再归因到它生前的对端。
+        let evs = feed(&mut p, "SEND|3000|1234|1234|1|5|7|1");
         let send = evs.iter().find(|e| e.kind == Kind::InfraNetSendto).unwrap();
         match &send.payload {
             crate::event::Payload::NetSendto { peer, .. } => assert_eq!(peer, &None),

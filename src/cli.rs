@@ -405,8 +405,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 .into(),
         );
     }
-    if cli.pid.is_none() && cli.cgroup.is_none() && cli.session.is_none() {
-        return Err("you must specify a target: -p/--pid, -C/--cgroup or -S/--session.\n\
+    // `--kernel-lines` 也是内核源（回放一份已采到的内核行），所以它单独出现时
+    // 同样是一个**完整的目标** —— 下面的"回放与实时互斥"校验会接管剩下的规则。
+    if cli.pid.is_none()
+        && cli.cgroup.is_none()
+        && cli.session.is_none()
+        && cli.kernel_lines.is_none()
+    {
+        return Err("you must specify a target: -p/--pid, -C/--cgroup, -S/--session or \
+             --kernel-lines.\n\
              agtrace never traces system-wide — an unfiltered openat would drown\n\
              the timeline within seconds."
             .into());
@@ -480,6 +487,16 @@ mod tests {
         match p(&["agtrace", "-S", "/tmp/t.jsonl"]).unwrap() {
             Parsed::Run(c) => assert_eq!(c.session.as_deref(), Some("/tmp/t.jsonl")),
             _ => panic!(),
+        }
+    }
+
+    /// `--kernel-lines` 自己就是一个完整目标：离线回放一份已采到的内核行，
+    /// 不需要（也不该强制）再给 -S/-p。（`--help` 一直把它列在 Target 一栏。）
+    #[test]
+    fn kernel_lines_alone_is_a_valid_target() {
+        match p(&["agtrace", "--kernel-lines", "/tmp/cap.txt"]).unwrap() {
+            Parsed::Run(c) => assert_eq!(c.kernel_lines.as_deref(), Some("/tmp/cap.txt")),
+            _ => panic!("应当解析成 Run"),
         }
     }
 

@@ -134,6 +134,19 @@ mod tests {
         assert_eq!(v["payload"]["bash_cmd"], "ls");
     }
 
+    /// 楔形在线上必须是**自己的** kind：`--output json` 的消费者按 `kind`
+    /// 过滤时得分得开"这条慢"（gap）和"这条对不上账"（wedge）。
+    #[test]
+    fn wedge_is_its_own_kind_on_the_wire() {
+        let mut ev = e();
+        ev.kind = Kind::DerivedToolWedge;
+        let v: serde_json::Value = serde_json::from_str(&line(&ev)).unwrap();
+        assert_eq!(v["kind"], "derived.tool.wedge");
+        assert_eq!(Kind::DerivedToolWedge.as_str(), "derived.tool.wedge");
+        assert_eq!(Kind::DerivedToolWedge.short(), "wedge");
+        assert_ne!(Kind::DerivedToolGap.as_str(), Kind::DerivedToolWedge.as_str());
+    }
+
     #[test]
     fn payload_type_tag_matches_serde_tag() {
         let v: serde_json::Value = serde_json::from_str(&line(&e())).unwrap();

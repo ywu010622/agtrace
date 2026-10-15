@@ -143,6 +143,10 @@ impl AyaCollector {
             c.arg("-n").arg(&exe);
             c
         };
+        // 特权子进程只拿到 PATH（+ RUST_BACKTRACE）：loader 是同一个二进制、
+        // 不读任何环境变量，而用户会话里的密钥没有理由跟着进 root（见
+        // child::scrub_env）。`exe` 是绝对路径，所以清空 PATH 也不会影响查找。
+        super::child::scrub_env(&mut cmd);
         cmd.args(&args);
 
         let what = format!("{} {}", exe.display(), args.join(" "));

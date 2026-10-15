@@ -420,6 +420,9 @@ macro_rules! emit {
         if let Some(mut __entry) = EVENTS.reserve::<RawEvent>(0) {
             let $e: &mut RawEvent = unsafe { &mut *__entry.as_mut_ptr() };
             $e.clear();
+            // ABI 哨兵：用户态据此确认"这条记录确实是按我这份结构体写出来的"。
+            // 一条 store，换掉一整类静默的字段误读。
+            $e.magic = RAW_MAGIC;
             $e.kind = $kind;
             $e.ts_ns = ts();
             let (__pid, __tid) = ids();
@@ -486,24 +489,29 @@ pub fn on_exit(ctx: TracePointContext) -> u32 {
     if !matches(pid) {
         return 0;
     }
-    let (comm, clen) = comm_buf();
-    let code = task_exit_code();
     let group_dead = field(&ctx, CFG_EXIT_GROUP_DEAD) != 0;
 
-    if src_on(SRC_EXEC) {
-        emit!(KIND_EXIT, e, {
-            e.ppid = parent_of(pid);
-            e.n0 = code;
-            e.n_str = 1;
-            e.lens[0] = clen;
-            e.strs[0] = comm;
-        });
-    }
-
-    // Only the last thread of a group evicts it. See the module comment: the `.bt`
-    // script evicted on every thread exit and silently lost multi-threaded targets
-    // from the filter.
+    // `sched_process_exit` fires for *every* thread, but the row it feeds — `EXIT`,
+    // i.e. `runtime.proc.exit` — says "the process exited", and userspace hangs it
+    // on the call's evidence as the process's own status. Emitting it from a worker
+    // thread would date the process exit early and report that thread's status as
+    // the process's. `group_dead` is the tracepoint's own "this was the last thread"
+    // flag: the same flag, for the same reason, as the eviction below. See the
+    // module comment — the `.bt` script got both of these wrong.
+    //
+    // Both reads sit inside the gate: a thread exit that is not the process's is
+    // the common case on a multi-threaded target, and neither read is free.
     if group_dead {
+        if src_on(SRC_EXEC) {
+            let (comm, clen) = comm_buf();
+            emit!(KIND_EXIT, e, {
+                e.ppid = parent_of(pid);
+                e.n0 = task_exit_code();
+                e.n_str = 1;
+                e.lens[0] = clen;
+                e.strs[0] = comm;
+            });
+        }
         let _ = IN_TREE.remove(&pid);
         let _ = PARENT_OF.remove(&pid);
     }

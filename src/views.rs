@@ -746,9 +746,12 @@ impl Views {
                     "association is heuristic — verify the process tree really is that session"
                 }
             );
+            // 楔形有自己的 kind（`derived.tool.wedge`）：它是**因果**矛盾，
+            // 不是 gap 那种**时间**异常。混在 gap 里会让按 kind 过滤的消费者
+            // 分不开"这条慢"和"这条对不上账"。
             out.push(derived_from(
                 &c.src,
-                Kind::DerivedToolGap,
+                Kind::DerivedToolWedge,
                 "wedge:no kernel effect",
                 &d,
                 0,
@@ -1093,9 +1096,15 @@ mod tests {
         // 楔形是**关于整段运行**的断言，只能在收尾时下 —— 见 finish() 里的说明。
         let d = v.finish();
         assert!(
-            d.iter().any(|e| e.kind == Kind::DerivedToolGap
+            d.iter().any(|e| e.kind == Kind::DerivedToolWedge
                 && matches!(&e.payload, Payload::Derived { label, .. } if label.contains("wedge"))),
             "未报出楔形：{:?}",
+            d
+        );
+        // 楔形不得再借用 gap 的 kind：两者的语义（因果 vs 时间）必须能按 kind 分开。
+        assert!(
+            !d.iter().any(|e| e.kind == Kind::DerivedToolGap),
+            "楔形不能以 derived.tool.gap 报出：{:?}",
             d
         );
         assert_eq!(v.wedge_count, 1);

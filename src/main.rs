@@ -474,21 +474,25 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         // 的单调值 —— 拿墙钟和内核的 `nsecs` 比大小是两个不同的钟在比。
         kernel_evs.sort_by_key(|e| (e.ts_ns, e.seq));
         agent_evs.sort_by_key(|e| (merge_key(e, &merger.clock), e.ts_wall_ns));
-        let (mut ki, mut ai) = (0usize, 0usize);
-        while ki < kernel_evs.len() || ai < agent_evs.len() {
-            let take_kernel = match (kernel_evs.get(ki), agent_evs.get(ai)) {
+        // 归并时**交出所有权**而不是 clone：两个 Vec 在这里被整条消费掉，之后
+        // 谁都不再用它们，clone 只是白拷一遍每条事件里的 String / Vec 堆分配。
+        // `peekable` 而不是下标 —— 下标取值只能借，借出来的东西进不了 `push_*`。
+        let mut kernel_it = kernel_evs.into_iter().peekable();
+        let mut agent_it = agent_evs.into_iter().peekable();
+        loop {
+            let take_kernel = match (kernel_it.peek(), agent_it.peek()) {
                 (Some(k), Some(a)) => k.ts_ns <= merge_key(a, &merger.clock),
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,
             };
             if take_kernel {
-                let ev = kernel_evs[ki].clone();
-                ki += 1;
-                merger.push_kernel(ev);
-            } else {
-                let ev = agent_evs[ai].clone();
-                ai += 1;
+                // `peek` 刚刚说过还有，所以这里是 `Some`；写成 `if let` 是为了不给
+                // 归并循环留一个会 panic 的分支。
+                if let Some(ev) = kernel_it.next() {
+                    merger.push_kernel(ev);
+                }
+            } else if let Some(ev) = agent_it.next() {
                 merger.push_agent(ev);
             }
         }

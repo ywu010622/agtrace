@@ -55,7 +55,11 @@ pub enum Target {
 /// exercises the exact `sudo -n bpftrace` path the real spawn uses (so a sudo
 /// policy problem is reported as such rather than as a missing binary).
 pub fn precheck() -> Result<(), String> {
-    let out = Command::new("sudo")
+    let mut cmd = Command::new("sudo");
+    // 同 [`spawn`]：探针也是一次特权 spawn，用户的密钥没理由跟着进去。
+    // `PATH` 在白名单里，所以按名字找 `sudo` 这件事不受影响。
+    super::child::scrub_env(&mut cmd);
+    let out = cmd
         .args(["-n", "bpftrace", "--version"])
         .output()
         .map_err(|e| format!("could not run `sudo -n bpftrace --version`: {}", e))?;
@@ -124,6 +128,9 @@ impl BpftraceCollector {
         // （`Looks like the BPF stack limit is exceeded.`）。64 恰好是 512/8。
         // 保留这行不是指望它生效，而是：一旦哪天 target 不再是 sudo，它就该生效。
         let mut cmd = Command::new("sudo");
+        // 先清环境再设变量：用户的 token 不进特权子进程，而下面的
+        // `BPFTRACE_MAX_STRLEN` 照设不误（见 child::scrub_env）。
+        super::child::scrub_env(&mut cmd);
         cmd.arg("-n")
             .arg("bpftrace")
             .arg("-q") // 抑制 "Attaching N probes..."（map dump 由 END{clear()} 处理）

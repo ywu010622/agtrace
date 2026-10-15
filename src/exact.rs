@@ -716,8 +716,15 @@ impl ExactBinder {
             return all;
         }
         // ---- pass 1：推进状态、做判决、生成派生行 ----
+        //
+        // 只跑本批**新来的**行（`i >= carried_n`）。带过一批的行在上一批的 pass 1
+        // 里已经推进过一次状态了：再跑一次会把同一条 tool.call 再入队一份
+        // （`on_tool_call` 不是幂等的），于是它的副本会去认领第二条 exec，
+        // 把一个无关的 pid 标成 `exact`；`calls_seen` / `execs_seen` 也会一起翻倍。
+        // pass 2 对暂缓段的处理本来就是"不再重新判定、只重新盖章"（见下），
+        // 两遍的边界在这里必须一致。
         let mut inserted: HashMap<usize, Vec<Event>> = HashMap::new();
-        for (i, ev) in all.iter().enumerate() {
+        for (i, ev) in all.iter().enumerate().skip(carried_n) {
             match ev.kind {
                 Kind::AgentToolCall => self.on_tool_call(ev),
                 Kind::RuntimeProcExec => {
@@ -2000,6 +2007,27 @@ mod tests {
         assert!(binds(&a).is_empty());
         let c = run(&mut b, vec![exec(2 * S, 11, "/bin/echo", &["/bin/echo", "hi"])]);
         assert_eq!(binds(&c).len(), 1);
+    }
+
+    #[test]
+    fn a_held_tool_call_is_never_claimed_twice() {
+        // 暂缓的后缀在下一批会被 pass 1 重新看到。如果那条 tool.call 被**再入队一次**，
+        // 它就多出一份"未认领"的副本 —— 于是同一个命令的第二次 exec 会认领副本，
+        // 把一个无关的 pid 标成 `exact`（本工具最不该犯的错：凭空说一句确定的话）。
+        let mut b = ExactBinder::new(true);
+        let a = run(
+            &mut b,
+            vec![fork(2 * S, 10, 11), call(2 * S + 1, "toolu_a", "/bin/echo hi", false)],
+        );
+        assert!(a.is_empty(), "fork 未定论：从它起的整段后缀一起等");
+        let c = run(&mut b, vec![exec(2 * S + 2, 11, "/bin/echo", &["/bin/echo", "hi"])]);
+        assert_eq!(binds(&c).len(), 1);
+        assert_eq!(b.stats().calls_seen, 1, "暂缓的 tool.call 被重复计数");
+        // 一条 tool.call 只对应一条 exec：一模一样的第二条 exec 不该再被认领。
+        let d = run(&mut b, vec![exec(2 * S + 3, 12, "/bin/echo", &["/bin/echo", "hi"])]);
+        assert!(binds(&d).is_empty(), "重放暂缓前缀让同一条调用认领了两次");
+        assert_eq!(b.stats().calls_matched, 1);
+        assert_eq!(b.stats().execs_seen, 2, "暂缓的 exec 被重复计数");
     }
 
     #[test]

@@ -181,7 +181,14 @@ struct Call {
     id: Option<String>,
     tool: String,
     cmd: String,
+    /// `tool.call` 的单调钟 ts（排序主键，见 src/event.rs 文件头）。
     ts_ns: u64,
+    /// 同一条 `tool.call` 的**墙钟**（CLOCK_REALTIME 纳秒）。
+    ///
+    /// `ts_ns` 是单调钟，而观测窗口的左沿 `kernel_first_wall` 是从内核事件的
+    /// `ts_wall_ns` 来的 —— 两个不同钟源直接比大小恒为假，所以"这条调用在不在
+    /// 窗口里"必须拿墙钟比墙钟（见 [`FailAttributor::window_ok`]）。
+    ts_wall_ns: u64,
     resolved: bool,
     /// transcript 里的第几次 `tool.call`（见 [`Failure::step`]）。
     step: u64,
@@ -651,12 +658,16 @@ impl FailAttributor {
     ///
     /// 两个满足条件之一：调用发生在采集开始之后（`tool.call` 的 ts 晚于第一条
     /// 内核事件），或者这条调用本来就挂上了内核事件（那它当然在窗口里）。
+    ///
+    /// 比的是**墙钟**：`kernel_first_wall` 来自内核事件的 `ts_wall_ns`，而
+    /// `call.ts_ns` 是单调钟 —— 拿单调钟去比 epoch 恒为假，窗口判定会永远失败，
+    /// 于是没挂上内核事件的调用一律被当成"没资格核对"。
     fn window_ok(&self, key: &str, call: &Call) -> bool {
         if self.ev.get(key).is_some_and(|e| e.kernel_events > 0) {
             return true;
         }
         match self.kernel_first_wall {
-            Some(k) => call.ts_ns >= k,
+            Some(k) => call.ts_wall_ns >= k,
             // 一条内核行都没看见过：窗口是空的，"在窗口内"不成立。
             None => false,
         }
@@ -830,6 +841,7 @@ impl FailAttributor {
                 tool: tool.to_string(),
                 cmd: one_line(cmd),
                 ts_ns: ev.ts_ns,
+                ts_wall_ns: ev.ts_wall_ns,
                 resolved: false,
                 step,
             },
@@ -1713,6 +1725,113 @@ mod tests {
         assert!(a.failures[0].head.contains("no write open observed"), "{}", a.failures[0].head);
         assert!(a.failures[0].head.ends_with("!!"));
         assert_eq!(a.claims_mismatched, 1);
+    }
+
+    /// **钟源回归**：一条没挂上任何内核事件、但落在观测窗口内的调用，
+    /// `in_window` 必须为真。
+    ///
+    /// 修复前这里比的是 `call.ts_ns`（CLOCK_MONOTONIC）与 `kernel_first_wall`
+    /// （CLOCK_REALTIME epoch，来自内核事件的 `ts_wall_ns`）—— 单调钟要追平
+    /// epoch 得跑几百年，比较恒为假，于是窗口判定永远不成立。
+    #[test]
+    fn a_call_in_the_window_with_no_kernel_events_is_in_window() {
+        let cfg = FailCfg {
+            only: false,
+            kernel_available: true,
+            settle_ns: 0,
+            pid_linked: true,
+        };
+        let mut a = FailAttributor::new(cfg);
+        // 一条别处调用的内核行先把窗口左沿立起来。它挂着 t9，而 t9 不是
+        // 在等着的调用，所以不会给 t1 留下任何证据。
+        a.process(vec![exec_ok(S, "t9", 99, "/usr/bin/true")]);
+        // t1 在左沿**之后**才发起，且全程零内核事件。
+        a.process(vec![call(2 * S, "t1", "Bash", "echo hi")]);
+
+        let c = a.calls.get("t1").expect("调用该在表里");
+        assert_eq!(
+            a.ev.get("t1").map(|e| e.kernel_events).unwrap_or(0),
+            0,
+            "这条调用不该有内核事件"
+        );
+        assert!(
+            a.window_ok("t1", c),
+            "窗口内、零内核事件的调用被判成了不在窗口里（钟源比错了）"
+        );
+        let ev = Evidence::default();
+        let facts = a.facts_for("t1", c, &ev);
+        assert!(facts.in_window);
+    }
+
+    /// 上一条的**后果**回归：修复前 `in_window` 恒假，于是"会话级 pid 绑定 +
+    /// 没挂上内核事件"这条路永远走不通 —— claim 核对被静默跳过，矛盾被记成
+    /// `claims_unverified`（没资格核对）而不是 `claims_mismatched`。
+    #[test]
+    fn an_unlinked_call_in_the_window_is_still_eligible_for_claim_checking() {
+        let cfg = FailCfg {
+            only: false,
+            kernel_available: true,
+            settle_ns: 0,
+            pid_linked: true,
+        };
+        let mut a = FailAttributor::new(cfg);
+        a.process(vec![
+            // 窗口左沿：属于别的调用，不挂在 t1 上。
+            exec_ok(S, "t9", 99, "/usr/bin/true"),
+            // t1 在窗口内发起；它说自己写了盘，内核侧却一条事件都没有。
+            call(2 * S, "t1", "Bash", "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf"),
+            result(
+                3 * S,
+                "t1",
+                "Bash",
+                "Success",
+                "stdout: Saved to /tmp/v06demo2/work/gone.pdf",
+            ),
+        ]);
+        a.finish();
+
+        assert_eq!(
+            a.claims_unverified, 0,
+            "窗口内的调用被判成没资格核对 —— claim 核对又被跳过了"
+        );
+        assert_eq!(a.claims_mismatched, 1, "内核没看见落盘，对账却没跑起来");
+        assert_eq!(a.failures.len(), 1);
+        assert!(
+            a.failures[0].head.contains("no write open observed"),
+            "{}",
+            a.failures[0].head
+        );
+    }
+
+    /// 窗口**之外**的调用（发起于第一条内核事件之前）仍然不许核对 ——
+    /// 修复不能把这道门槛整个拆掉。
+    #[test]
+    fn a_call_before_the_window_is_not_eligible_even_with_no_kernel_events() {
+        let cfg = FailCfg {
+            only: false,
+            kernel_available: true,
+            settle_ns: 0,
+            pid_linked: true,
+        };
+        let mut a = FailAttributor::new(cfg);
+        a.process(vec![
+            // t1 先发起（采集器还没 attach）。
+            call(S, "t1", "Bash", "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf"),
+            // 窗口左沿随后才立起来。
+            exec_ok(2 * S, "t9", 99, "/usr/bin/true"),
+            result(
+                3 * S,
+                "t1",
+                "Bash",
+                "Success",
+                "stdout: Saved to /tmp/v06demo2/work/gone.pdf",
+            ),
+        ]);
+        a.finish();
+
+        assert_eq!(a.claims_mismatched, 0, "采集前的那一段不该被拿来核对");
+        assert_eq!(a.claims_unverified, 1, "没资格核对的 claim 必须只记数、不说话");
+        assert!(a.failures.is_empty());
     }
 
     /// 成功的结果文本里出现 `exit=7` 之类的字面量，**不能**被读成失败。

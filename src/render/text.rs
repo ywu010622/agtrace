@@ -154,6 +154,17 @@ impl TextRenderer {
         let budget = MAX_COLS.saturating_sub(prefix_cols).saturating_sub(display_width(&mk));
         let mut body = payload_line(ev, budget);
 
+        // 最后一处转义闸门：正文里承载的是**不可信文本**（内核给的路径/argv、
+        // transcript 给的工具名与状态串），而一个裸 `\x1b` 就是一个终端注入
+        // 原语（改窗口标题、清屏、在别人的 TTY 上画东西）。上游大部分字段已经
+        // 过 `one_line`，但"大部分"不是保证，所以在这里再兜一次 —— 出口只有
+        // 一个，闸门就放在出口。
+        //
+        // 必须在 `colorize` **之前**：agtrace 自己的 ANSI 是之后才包上去的，
+        // 先着色再转义会把自家的颜色码一起打成可见文本。
+        // 位置也必须在宽度判定之前：转义后的 `\x1b` 是 4 列，按原样量会低估宽度。
+        body = crate::event::one_line(&body);
+
         // 截断在**着色之前**做：ANSI 转义也是字节，先着色再量长度会把转义码
         // 算成可见宽度，于是明明只有 100 列的行被误判成超宽。
         let mut display_capped = false;
@@ -197,8 +208,10 @@ impl TextRenderer {
                     "{:>13}  ts_src={}{}",
                     "",
                     ev.ts_src.as_str(),
-                    if ev.corr.tool_use_id.is_some() {
-                        format!("  tool_use_id={}", ev.corr.tool_use_id.as_deref().unwrap_or(""))
+                    if let Some(id) = ev.corr.tool_use_id.as_deref() {
+                        // 这一串直接来自 transcript，和正文同样不可信 —— 续行也是
+                        // 终端输出，闸门不能只设在正文那一条上。
+                        format!("  tool_use_id={}", crate::event::one_line(id))
                     } else {
                         String::new()
                     }
@@ -792,6 +805,41 @@ mod tests {
         assert!(!line.contains('\n'), "正文里不得出现裸换行: {:?}", line);
         assert!(line.contains("\\n"), "换行必须转义成可见的 \\n: {:?}", line);
         assert!(display_width(&line) <= MAX_COLS, "{:?}", line);
+    }
+
+    /// 不可信文本里的裸 `\x1b` 绝不能出现在输出里 —— 那是一个终端注入原语
+    /// （改标题、清屏），而这些字符串来自 transcript / 内核，不是我们写的。
+    /// 工具名走的是 `sfield`（不转义），正是这条闸门要拦的东西。
+    #[test]
+    fn escape_sequences_from_untrusted_text_never_reach_the_line() {
+        for (color, verbose) in [(false, false), (true, true)] {
+            let r = TextRenderer::new(RenderOpts {
+                color,
+                verbose,
+                ..Default::default()
+            });
+            let mut e = ev(
+                Kind::AgentToolCall,
+                Layer::Agent,
+                Payload::ToolCall {
+                    tool: "\u{1b}]0;pwned\u{7}Bash".into(),
+                    input_preview: "x".into(),
+                    input_bytes: 1,
+                    via_mcp: false,
+                    bash_cmd: None,
+                },
+            );
+            e.corr.tool_use_id = Some("\u{1b}[2Jid".into());
+            let line = r.render_one(&e);
+            // color=true 时颜色码本身是 ESC，所以只允许 `\x1b[` 这种自家开的码，
+            // 绝不允许把载荷里的 ESC 原样打出去。
+            assert!(
+                !line.contains("\u{1b}]") && !line.contains("\u{1b}[2J"),
+                "载荷里的控制序列必须被转义: {:?}",
+                line
+            );
+            assert!(line.contains("\\x1b"), "转义要看得见: {:?}", line);
+        }
     }
 
     fn strip_ansi(s: &str) -> String {

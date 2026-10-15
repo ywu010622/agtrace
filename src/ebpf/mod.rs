@@ -26,7 +26,7 @@ pub mod format;
 pub mod record;
 
 use agtrace_ebpf_common as abi;
-use agtrace_ebpf_common::RawEvent;
+use agtrace_ebpf_common::{RAW_MAGIC, RawEvent};
 use aya::maps::{Array, HashMap as BpfHashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::TracePoint;
 use aya::{Ebpf, EbpfLoader};
@@ -273,7 +273,13 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
     // figure, and on a busy box it is what turns "attached" into "capturing".
     let mut first_event_ms: Option<u128> = None;
 
-    while !STOP.load(Ordering::Relaxed) {
+    // One pass is: drain the ring, write the burst, then wait for more. `STOP` is
+    // tested *after* the drain rather than in the loop condition so that the pass
+    // the signal lands on still empties the ring. That is what the parent's grace
+    // period is for (`collector::child::shutdown`): the events committed just
+    // before the SIGTERM — the exit that ended the run, the last file close — are
+    // sitting in the kernel buffer, not on our stdout.
+    loop {
         let mut wrote = false;
         // Drain everything the ring has: one write syscall per burst rather than
         // per event.
@@ -286,6 +292,15 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
                 continue;
             }
             let rec: &RawEvent = unsafe { &*(data.as_ptr() as *const RawEvent) };
+            // The length check above only catches a layout change that changes the
+            // *size*. Two same-width fields swapping places keeps the size and
+            // would be read as the wrong values; the sentinel the producer writes
+            // into the record closes that hole. Same policy as a size mismatch:
+            // drop it and count it, never guess.
+            if rec.magic != RAW_MAGIC {
+                skipped += 1;
+                continue;
+            }
             if first_event_ms.is_none() {
                 first_event_ms = Some(attach_started.elapsed().as_millis());
             }
@@ -297,6 +312,15 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
                 .map_err(|e| format!("writing protocol output failed: {}", e))?;
             out.flush().map_err(|e| format!("flushing protocol output failed: {}", e))?;
             text.clear();
+        }
+
+        // The parent SIGTERMs this process when it is done. The ring has just been
+        // emptied, so everything the kernel had already committed is in `out`.
+        // Probes stay attached until this process dies, so a record committed in
+        // the sliver after this drain is still lost — but that sliver is a few
+        // microseconds wide, not the whole buffer.
+        if STOP.load(Ordering::Relaxed) {
+            break;
         }
 
         let now = Instant::now();
@@ -316,9 +340,9 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
         wait_readable(&ring, until_tick.min(IDLE_POLL));
     }
 
-    // The parent SIGTERMs this process when it is done. Report what the kernel
-    // could not deliver *before* exiting: a loss count that never reaches the
-    // timeline is exactly the silent gap this project refuses to ship.
+    // Report what the kernel could not deliver *before* exiting: a loss count that
+    // never reaches the timeline is exactly the silent gap this project refuses to
+    // ship. It is read after the final drain, so a loss during that drain counts too.
     let _ = out.flush();
     drop(out);
     report(cfg, ring_lost(&mut bpf), skipped, attach_ms, first_event_ms);
@@ -352,8 +376,8 @@ fn report(
     );
     if skipped > 0 {
         eprintln!(
-            "agtrace-ebpf: dropped {} record(s) whose size did not match this binary's \
-             RawEvent ({} bytes) — the eBPF object and the loader are out of step",
+            "agtrace-ebpf: dropped {} record(s) whose size or ABI magic did not match this \
+             binary's RawEvent ({} bytes) — the eBPF object and the loader are out of step",
             skipped,
             std::mem::size_of::<RawEvent>()
         );
