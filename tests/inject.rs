@@ -223,6 +223,11 @@ impl Seed {
 
     /// 落地（含 `files/`），跑一次 `--failures-only`。
     fn run(&self) -> (Run, Scratch) {
+        self.run_with_env(&[])
+    }
+
+    /// 同 `run`，但给子进程多传环境变量（测试钩子用，不污染全局）。
+    fn run_with_env(&self, env: &[(&str, &str)]) -> (Run, Scratch) {
         let c = Clock::new();
         let sc = Scratch::new(&self.name);
         for (name, body) in &self.files {
@@ -232,15 +237,18 @@ impl Seed {
         let (events, kernel) = self.materialize(&sc, &c);
         let transcript = sc.write("events.jsonl", &(events + "\n"));
         let kfile = sc.write("kernel.txt", &(kernel + "\n"));
-        let run = run_agtrace(&[
-            "--adapter",
-            "jsonl",
-            "-S",
-            &transcript,
-            "--kernel-lines",
-            &kfile,
-            "--failures-only",
-        ]);
+        let run = run_agtrace_with_env(
+            &[
+                "--adapter",
+                "jsonl",
+                "-S",
+                &transcript,
+                "--kernel-lines",
+                &kfile,
+                "--failures-only",
+            ],
+            env,
+        );
         (run, sc)
     }
 }
@@ -254,10 +262,16 @@ fn agtrace() -> &'static str {
 }
 
 fn run_agtrace(args: &[&str]) -> Run {
-    let out = Command::new(agtrace())
-        .args(args)
-        .output()
-        .expect("cannot run the agtrace binary");
+    run_agtrace_with_env(args, &[])
+}
+
+fn run_agtrace_with_env(args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(agtrace());
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("cannot run the agtrace binary");
     Run {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
@@ -478,9 +492,54 @@ fn dishonest_fetch_claim_reports_no_outbound_connect() {
     run.assert_row_count(1, case);
 }
 
+/// Write 工具的一句结果（"Wrote X"），内核里**没有**那笔写。
+///
+/// 这是 critical #1（`fail.rs::window_ok` 时钟域错配）的端到端回归：Write
+/// 工具不 spawn 进程，这个调用**没有任何**内核事件 —— `window_ok` 走的是
+/// 墙钟比较那条路，而不是 `kernel_events > 0` 的短路。修复前那条比较恒为假，
+/// 这句 claim 会被记成 `unverified`（悄悄放过），而不是这里断言的 `!!`。
+#[test]
+fn dishonest_write_tool_claim_is_contradicted_by_the_kernel() {
+    let case = "dishonest-write-tool-claim";
+    // 回放没有 live pid 可绑定，`session_linked` 恒为 false —— 不开这个钩子，
+    // 零内核事件的 Write 调用永远到不了 `evaluate`，这个测试就恒为"无行"。
+    let (run, _sc) =
+        Seed::load(case).run_with_env(&[("AGTRACE_TEST_FORCE_PID_LINKED", "1")]);
+
+    let row = assert_points_at(&run, 1, "Write", case);
+    assert!(row.ends_with("!!"), "the row lost its `!!`:\n{}", row);
+    assert_line(
+        &run,
+        case,
+        &["claim:", "wrote", "report.pdf", "| kernel: no write open observed !!"],
+    );
+    run.assert_row_count(1, case);
+    assert_line(
+        &run,
+        case,
+        &["└─ output", "report.pdf", "referenced later by step 2 Read"],
+    );
+}
+
+/// 没有内核源时，不许说 `!!`。
+///
+/// 这是上一条的反面（诚实边界）：`can_speak()` 的门槛没过，claim 只能记
+/// `unverified`。测试锁的是"不乱说话" —— 修 clock bug 的时候如果把门拆了，
+/// 这条会先叫。
+#[test]
+fn write_tool_claim_without_kernel_is_unverified_not_mismatched() {
+    let case = "unverified-write-tool-no-kernel";
+    let (run, _sc) = Seed::load(case).run();
+
+    run.assert_row_count(0, case);
+    run.must_not_contain("!!", case);
+}
+
 // ===============================================================
 // 三、循环故障（同一条命令重复 3 次，A.4 的 looping 模式）
 // ===============================================================
+
+
 
 /// 循环的第 3 次真的失败了：失败落在第 3 步，血缘说明"这个产物第 1 步就下过"。
 #[test]

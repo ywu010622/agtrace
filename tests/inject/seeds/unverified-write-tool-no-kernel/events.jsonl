@@ -1,0 +1,3 @@
+{"type":"prompt","text":"write the Q3 report","ts":0}
+{"type":"tool.call","id":"c1","tool":"Write","input":{"file_path":"$DIR/work/report.pdf"},"ts":300}
+{"type":"tool.result","id":"c1","status":"success","output":"Wrote $DIR/work/report.pdf","ts":900}

@@ -1,0 +1,4 @@
+EXEC|100|4242|4242|1|0|3|bash|/usr/bin/bash
+ARGV|100|4242|4242|0|bash
+ARGV|100|4242|4242|1|-c
+ARGV|100|4242|4242|2|echo hello

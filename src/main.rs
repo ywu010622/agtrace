@@ -313,6 +313,13 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     // 之间没有证据链，"内核里没有这次写入"也就不成立。
     let mut fail_cfg = fail_cfg;
     fail_cfg.pid_linked = matches!(bind.level, Binding::Exact | Binding::Heuristic);
+    // 测试钩子：`AGTRACE_TEST_FORCE_PID_LINKED=1` 强制走 `session_linked` 那条路。
+    // 注入测试（`--kernel-lines` 回放）没有 live pid 可绑定，`binding::resolve`
+    // 永远返回 None —— 于是 Write/Edit 这类零内核事件工具的 claim 永远走不到
+    // `evaluate`，critical #1 那类 bug 在端到端层就永远测不到。生产环境不要设。
+    if std::env::var("AGTRACE_TEST_FORCE_PID_LINKED").as_deref() == Ok("1") {
+        fail_cfg.pid_linked = true;
+    }
     let mut failer = FailAttributor::new(fail_cfg);
 
     // ---------------- v0.3 argv 级绑定（§3.5 三级）----------------
