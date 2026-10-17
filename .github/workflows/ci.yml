@@ -1,0 +1,170 @@
+name: CI
+
+# Full quality gate for the Rust binary + its embedded eBPF object.
+#
+# The project is Linux-only by design (aya/eBPF, libc, /proc); there is no
+# macOS/Windows matrix on purpose. The one non-obvious requirement is that the
+# *host* build drives a nested nightly build of `agtrace-ebpf` with
+# `-Z build-std=core` and links it with `bpf-linker`, so CI installs both and
+# then asserts that a non-empty eBPF object was actually embedded (build.rs is
+# allowed to degrade to a zero-byte stub, which must never pass CI silently).
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  # Weekly drift check: catches a new rustc/clippy/rustsec change even when the
+  # tree is quiet. Monday 05:17 UTC.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# Least privilege: CI only reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the superseded run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # One pin for the eBPF toolchain: the prebuilt linker must match the object
+  # format the nightly rustc emits, and build.rs links with it.
+  BPF_LINKER_VERSION: v0.12.0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting. Cheap, no build required.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  # ---------------------------------------------------------------------------
+  # Lints. The lint gate does not need the embedded eBPF object: building it
+  # would install/spawn the nightly toolchain on every lint run. AGTTRACE_SKIP_EBPF
+  # makes build.rs write the empty stub, which is fine for a `clippy` check.
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+      - name: cargo clippy --all-targets -- -D warnings
+        env:
+          AGTTRACE_SKIP_EBPF: "1"
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # The real thing: stable host toolchain + nightly eBPF toolchain + bpf-linker,
+  # a release build whose embedded object is verified, then the whole test suite
+  # (347 unit tests, 13 offline kernel-replay e2e tests, 6 DeepSeek Harness
+  # adapter e2e tests). None of the tests need root or a live kernel: the
+  # kernel-side suite replays captured line streams through the same parser.
+  # ---------------------------------------------------------------------------
+  test:
+    name: build (eBPF) + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly toolchain for the eBPF crate
+        # agtrace-ebpf is no_std and builds for bpfel-unknown-none with
+        # -Z build-std=core, so it needs a nightly compiler *and* rust-src.
+        run: rustup toolchain install nightly --profile minimal --component rust-src && rustup run nightly rustc --version
+
+      - name: Cache bpf-linker
+        id: cache-bpf-linker
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.BPF_LINKER_VERSION }}-x86_64-unknown-linux-musl
+
+      - name: Install bpf-linker (prebuilt, no LLVM toolchain needed)
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # The prebuilt musl binary is statically linked, so CI does not need
+          # the LLVM dev packages a `cargo install bpf-linker` would require.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          zstd -d -c /tmp/bpf-linker.tar.zst | tar -x -C "$HOME/.cargo/bin"
+          "$HOME/.cargo/bin/bpf-linker" --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - name: Build release binary (drives the nested eBPF build)
+        run: cargo build --release
+
+      - name: Assert a real eBPF object was embedded
+        # build.rs deliberately degrades to a zero-byte stub when the eBPF
+        # toolchain is missing; for the binary that ships, that degradation must
+        # be a loud CI failure, not a quietly collector-less release build.
+        run: |
+          set -euo pipefail
+          obj="$(find target/release/build -type f -name 'agtrace-ebpf.o' -size +10k | head -n 1)"
+          if [ -z "$obj" ]; then
+            echo "::error::build.rs produced the zero-byte eBPF stub; the aya collector would be missing from this binary"
+            find target/release/build -type f -name 'agtrace-ebpf.o' -exec ls -l {} \; || true
+            exit 1
+          fi
+          ls -l "$obj"
+          target/release/agtrace --version
+          target/release/agtrace --help >/dev/null
+
+      - name: Test suite
+        run: cargo test
+
+      - name: Upload the binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: agtrace-release-x86_64-unknown-linux-gnu
+          path: target/release/agtrace
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Dependency advisories. Advisory on purpose: a fresh RUSTSEC entry in an
+  # upstream dependency must be visible, but it should not block unrelated work.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: cargo audit (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit

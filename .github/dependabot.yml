@@ -1,0 +1,33 @@
+# Dependabot keeps the pinned toolchain inputs and the Rust dependency graph
+# current. GitHub Actions updates are what keep the workflow files from silently
+# rotting (action major-version bumps, deprecations).
+#
+# Note: the eBPF toolchain (nightly compiler, bpf-linker) is *not* a cargo
+# dependency — it is pinned explicitly in .github/workflows/*.yml. Bump it there
+# on purpose, not automatically: the eBPF object ABI and the linker are coupled.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Europe/Amsterdam"
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:15"
+      timezone: "Europe/Amsterdam"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]

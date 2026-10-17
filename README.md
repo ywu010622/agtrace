@@ -1,5 +1,9 @@
 # agtrace
 
+[![CI](https://github.com/ywu010622/agtrace/actions/workflows/ci.yml/badge.svg)](https://github.com/ywu010622/agtrace/actions/workflows/ci.yml)
+[![Release](https://github.com/ywu010622/agtrace/actions/workflows/release.yml/badge.svg)](https://github.com/ywu010622/agtrace/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **strace for AI agents.** One live timeline joining what the agent *claims* with what the kernel *actually did*.
 
 ![agtrace demo](demo.gif)
@@ -193,7 +197,53 @@ is no second command to run. Note that `rustup target add bpfel-unknown-none` do
 **not** work — that target has no prebuilt `core`, which is exactly why
 `.cargo/config.toml` sets `build-std`. If the eBPF toolchain is missing, the build
 prints a warning and produces a binary whose `--collector aya` degrades to bpftrace
-rather than failing.
+rather than failing. CI pins a prebuilt
+[`bpf-linker`](https://github.com/aya-rs/bpf-linker) (`v0.12.0`, static musl) so
+no LLVM dev packages are needed; locally `cargo install bpf-linker` works too.
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push/PR,
+weekly on a schedule, and on demand:
+
+| Job | What it enforces |
+|---|---|
+| `rustfmt` | `cargo fmt --all --check` |
+| `clippy (-D warnings)` | `cargo clippy --all-targets -- -D warnings` (host paths only; the embedded-object build is covered by the `test` job) |
+| `build (eBPF) + tests` | stable host build, nightly `rust-src`, pinned `bpf-linker v0.12.0`, `cargo build --release`, **assert the embedded eBPF object is real (not the zero-byte stub)**, `cargo test` (366 tests: unit + offline kernel-replay e2e + DSH adapter e2e), and the release binary uploaded as an artifact |
+| `cargo audit` | advisory dependency-advisory scan (does not block unrelated PRs) |
+
+`build.rs` is deliberately allowed to degrade to a zero-byte eBPF stub when the
+nightly/linker toolchain is absent. CI turns that degradation into a hard failure
+for the shipped binary: a release with no `aya` collector must never be built by
+accident. Reproduce the CI run locally with:
+
+```bash
+rustup toolchain install nightly --profile minimal --component rust-src
+curl -fsSL -o /tmp/bpf-linker.tar.zst \
+  "https://github.com/aya-rs/bpf-linker/releases/download/v0.12.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+zstd -d -c /tmp/bpf-linker.tar.zst | tar -x -C "$HOME/.cargo/bin"
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo build --release && cargo test
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) publishes a
+release for every `v*` tag: it rebuilds with the real eBPF object, re-runs the
+test suite, refuses a tag that does not match the `Cargo.toml` version, and
+uploads a tarball plus SHA-256 and a build-provenance attestation. Manual
+`workflow_dispatch` runs do the same build/attest/upload without creating a
+release. Dependabot (`.github/dependabot.yml`) keeps cargo and Actions inputs
+current weekly; the eBPF toolchain is pinned in the workflows on purpose, since
+the linker and the object ABI are coupled.
+
+CI is Linux-only by design — the binary, `aya`/eBPF and `/proc` are Linux
+interfaces; there is no macOS/Windows matrix to fake support that does not exist.
+
+```bash
+# release flow
+git tag v0.7.0 && git push origin v0.7.0
+```
 
 ## License
 

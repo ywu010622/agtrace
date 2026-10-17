@@ -1,0 +1,126 @@
+name: Release
+
+# Tagging a commit (`git tag v0.7.0 && git push origin v0.7.0`) builds the
+# self-contained Linux binary with the real embedded eBPF object, packages it
+# with checksums and a build-provenance attestation, and publishes a GitHub
+# Release. `workflow_dispatch` builds/attests the artifact without creating a
+# release (useful for dry runs).
+#
+# No macOS/Windows artifact: agtrace is Linux-only (aya/eBPF + libc + /proc).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write     # create the GitHub Release
+  id-token: write     # build provenance attestation
+  attestations: write # build provenance attestation
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BPF_LINKER_VERSION: v0.12.0
+
+jobs:
+  release:
+    name: build, test, package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history for generated release notes
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly toolchain for the eBPF crate
+        run: rustup toolchain install nightly --profile minimal --component rust-src && rustup run nightly rustc --version
+
+      - name: Cache bpf-linker
+        id: cache-bpf-linker
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.BPF_LINKER_VERSION }}-x86_64-unknown-linux-musl
+
+      - name: Install bpf-linker (prebuilt)
+        if: steps.cache-bpf-linker.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          curl -fsSL -o /tmp/bpf-linker.tar.zst \
+            "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          zstd -d -c /tmp/bpf-linker.tar.zst | tar -x -C "$HOME/.cargo/bin"
+          "$HOME/.cargo/bin/bpf-linker" --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Assert a real eBPF object was embedded
+        run: |
+          set -euo pipefail
+          obj="$(find target/release/build -type f -name 'agtrace-ebpf.o' -size +10k | head -n 1)"
+          if [ -z "$obj" ]; then
+            echo "::error::build.rs produced the zero-byte eBPF stub; refusing to publish a collector-less release"
+            exit 1
+          fi
+          ls -l "$obj"
+
+      - name: Test suite (gate the release on green tests)
+        run: cargo test
+
+      - name: Package tarball + checksum
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(target/release/agtrace --version | awk '{print $2}')"
+          name="agtrace-${version}-x86_64-unknown-linux-gnu"
+          # A tag must match the crate version: prevents mislabelled releases.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}"
+            exit 1
+          fi
+          mkdir -p "dist/${name}"
+          cp target/release/agtrace "dist/${name}/agtrace"
+          cp README.md LICENSE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          ls -l dist/
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        # Only a real tag creates a Release; a manual dispatch is a dry run that
+        # still produces the attested artifact above.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
