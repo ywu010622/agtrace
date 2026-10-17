@@ -186,6 +186,10 @@ enum BufItem {
     Grouped(Event, u64),
 }
 
+// `Collapsed` 内嵌的是已经渲染好的一整行派生事件（约 0.5 KB）；把它装箱
+// 会让每次折叠多一次堆分配，而这张表同时最多只有个位数条目 —— 直接内嵌
+// 更便宜。clippy 只看枚举大小，看不到这个热路径上的分配代价。
+#[allow(clippy::large_enum_variant)]
 enum GroupState {
     /// 还在等判定依据（成功 exec / 窗口关闭）。
     Open,
@@ -409,15 +413,14 @@ impl Collapser {
         // 身份标注必须在更新身份表**之前**：fork 行要显示的是"fork 的那一刻
         // 父进程在跑什么"，而不是这一行本身带来的新信息。
         let mut identity_hit = false;
-        if self.cfg.identity && ev.kind == Kind::RuntimeProcFork {
-            if let Some(pid) = ev.pid {
-                if let Some(hint) = self.proc.hint(pid) {
-                    if let Payload::ProcFork { parent_argv, .. } = &mut ev.payload {
-                        *parent_argv = Some(hint);
-                        identity_hit = true;
-                    }
-                }
-            }
+        if self.cfg.identity
+            && ev.kind == Kind::RuntimeProcFork
+            && let Some(pid) = ev.pid
+            && let Some(hint) = self.proc.hint(pid)
+            && let Payload::ProcFork { parent_argv, .. } = &mut ev.payload
+        {
+            *parent_argv = Some(hint);
+            identity_hit = true;
         }
         if identity_hit {
             self.stats.identity_hits += 1;
@@ -490,9 +493,7 @@ impl Collapser {
     fn on_exec_ok(&mut self, ev: &Event) -> Option<u64> {
         let pid = ev.pid?;
         let base = exec_basename(ev)?;
-        let Some(gid) = self.exec_open.get(&pid).copied() else {
-            return None;
-        };
+        let gid = self.exec_open.get(&pid).copied()?;
         let matched = self
             .groups
             .get(&gid)
@@ -725,6 +726,9 @@ impl Collapser {
     /// 直到事件时间走过 `MERGE_NS`，或积压到 `HOLD_MAX_ITEMS`。
     /// 用事件时间而不是墙钟判合并资格的理由写在 `Pending::until` 上。
     fn release(&mut self, out: &mut Vec<Event>) {
+        // 与 `GroupState` 同理：`Collapsed` 内嵌一整行派生事件，装箱的堆分配
+        // 比这个局部枚举的栈占用更贵。clippy 只看大小差。
+        #[allow(clippy::large_enum_variant)]
         enum Act {
             Hold,
             Raw(u64),
@@ -861,28 +865,30 @@ impl Collapser {
         let key = collapse_detail(&d);
         // 1) 能并进手里的锚行吗？
         if d.kind == Kind::DerivedExecvp {
-            if let (Some(k), Some(p)) = (key.as_ref(), self.pending.as_mut()) {
-                if *k == p.key && d.ts_ns <= p.until {
-                    merge_into(&mut p.ev, &d);
-                    // 原始行数在 `close_exec` 定案时已经记过 —— 并进来的是**行数**
-                    // 不是新事件，再记一次就把"替掉多少行"翻倍（那是给用户核对的数）。
-                    self.stats.execvp_merged += 1;
-                    return;
-                }
+            if let (Some(k), Some(p)) = (key.as_ref(), self.pending.as_mut())
+                && *k == p.key
+                && d.ts_ns <= p.until
+            {
+                merge_into(&mut p.ev, &d);
+                // 原始行数在 `close_exec` 定案时已经记过 —— 并进来的是**行数**
+                // 不是新事件，再记一次就把"替掉多少行"翻倍（那是给用户核对的数）。
+                self.stats.execvp_merged += 1;
+                return;
             }
             // 1b) 手里的锚行已经因为超时落盘了，但窗口还没过 —— 它就在这一批的
             //     `out` 里，位置记在 `Emitted` 上（见那里的注释）。
             //     只在默认模式下走这条路：`-v` 的契约是"每个组一条摘要 + 它自己的
             //     原始行"，合并掉一条摘要会让原始行失去归属。
-            if !self.cfg.verbose {
-                if let (Some(k), Some(e)) = (key.as_ref(), self.emitted.as_ref()) {
-                    if *k == e.key && d.ts_ns <= e.until && e.idx < out.len() {
-                        let idx = e.idx;
-                        merge_into(&mut out[idx], &d);
-                        self.stats.execvp_merged += 1;
-                        return;
-                    }
-                }
+            if !self.cfg.verbose
+                && let (Some(k), Some(e)) = (key.as_ref(), self.emitted.as_ref())
+                && *k == e.key
+                && d.ts_ns <= e.until
+                && e.idx < out.len()
+            {
+                let idx = e.idx;
+                merge_into(&mut out[idx], &d);
+                self.stats.execvp_merged += 1;
+                return;
             }
         }
         // 2) 并不上：手里的锚行定格，先落盘。
@@ -893,15 +899,16 @@ impl Collapser {
         }
         // 3) 这条自己要不要开一个合并窗口？收尾阶段（`draining`）不再开 ——
         //    流的尽头没有"后面还有没有等价的"这个问题了。
-        if d.kind == Kind::DerivedExecvp && !self.draining {
-            if let Some(k) = key {
-                self.pending = Some(Pending {
-                    key: k,
-                    until: d.ts_ns.saturating_add(MERGE_NS),
-                    ev: d,
-                });
-                return;
-            }
+        if d.kind == Kind::DerivedExecvp
+            && !self.draining
+            && let Some(k) = key
+        {
+            self.pending = Some(Pending {
+                key: k,
+                until: d.ts_ns.saturating_add(MERGE_NS),
+                ev: d,
+            });
+            return;
         }
         out.push(d);
     }
@@ -913,10 +920,8 @@ impl Collapser {
     /// `finish` 落盘（`--duration` / EOF / Ctrl-C 都会走到那里）。
     fn flush_pending_if_past(&mut self, out: &mut Vec<Event>, ts: u64) {
         let past = self.pending.as_ref().map(|p| ts > p.until).unwrap_or(false);
-        if past {
-            if let Some(p) = self.pending.take() {
-                self.emit_anchor(out, p);
-            }
+        if past && let Some(p) = self.pending.take() {
+            self.emit_anchor(out, p);
         }
     }
 }
@@ -1634,7 +1639,7 @@ mod tests {
     #[test]
     fn a_child_inherits_the_parent_cmdline_until_it_execs() {
         let mut c = Collapser::new(CollapseCfg::default());
-        c.proc.set(42, "bash".into());
+        c.proc.set(42, "bash");
         let _ = c.process(vec![fork(1, 42, 100)], 2);
         let out = run(&mut c, vec![fork(3, 100, 200)], 4);
         // out[0] 是 42 派生的那个子进程，out[1] 才是子进程自己再 fork 的那次。

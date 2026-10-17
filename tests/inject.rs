@@ -53,10 +53,7 @@ use std::process::Command;
 const BASE_NS: u64 = 3_000_000_000;
 
 fn mono_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
@@ -152,10 +149,8 @@ struct Seed {
 impl Seed {
     fn load(name: &str) -> Self {
         let dir = Path::new(SEED_ROOT).join(name);
-        let read = |p: PathBuf| {
-            std::fs::read_to_string(&p)
-                .unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e))
-        };
+        let read =
+            |p: PathBuf| std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {}", p.display(), e));
         let events_raw = read(dir.join("events.jsonl"));
         let kernel_raw = read(dir.join("kernel.txt"));
         let mut files = Vec::new();
@@ -185,14 +180,11 @@ impl Seed {
             .filter(|l| !l.trim().is_empty())
             .map(|l| {
                 let l = l.replace("$DIR", &work);
-                let mut v: serde_json::Value = serde_json::from_str(&l)
-                    .unwrap_or_else(|e| panic!("[{}] bad seed line: {}", self.name, e));
-                let ms = v["ts"].as_u64().unwrap_or_else(|| {
-                    panic!(
-                        "[{}] every seed event needs an integer `ts` in ms: {}",
-                        self.name, l
-                    )
-                });
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&l).unwrap_or_else(|e| panic!("[{}] bad seed line: {}", self.name, e));
+                let ms = v["ts"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("[{}] every seed event needs an integer `ts` in ms: {}", self.name, l));
                 v["ts"] = serde_json::json!(c.ts(ms));
                 v.to_string()
             })
@@ -207,12 +199,12 @@ impl Seed {
                 // 协议的第 1 个字段恒是 nsecs；不是数字的行原样留着（种子里可以
                 // 故意放一行垃圾，验解析器的降级计数）。
                 let mut f: Vec<&str> = l.split('|').collect();
-                if f.len() > 1 {
-                    if let Ok(ms) = f[1].parse::<u64>() {
-                        let abs = c.nsecs(ms).to_string();
-                        f[1] = &abs;
-                        return f.join("|");
-                    }
+                if f.len() > 1
+                    && let Ok(ms) = f[1].parse::<u64>()
+                {
+                    let abs = c.nsecs(ms).to_string();
+                    f[1] = &abs;
+                    return f.join("|");
                 }
                 l
             })
@@ -392,11 +384,7 @@ fn assert_explains(run: &Run, needle: &str, case: &str) {
 /// 才是识别度所在），而临时目录的名字和长度是机器相关的。把整行写死，测试就会
 /// 依赖 tmp 目录的长度；按片段断言既稳，又仍然强制"这几件事出现在同一行"。
 fn assert_line(run: &Run, case: &str, parts: &[&str]) {
-    if run
-        .stdout
-        .lines()
-        .any(|l| parts.iter().all(|p| l.contains(p)))
-    {
+    if run.stdout.lines().any(|l| parts.iter().all(|p| l.contains(p))) {
         return;
     }
     panic!(
@@ -428,19 +416,11 @@ fn honest_failure_links_the_downstream_consumer() {
     let (run, sc) = Seed::load(case).run();
 
     assert_points_at(&run, 1, "Bash", case);
-    assert_explains(
-        &run,
-        "exit 22 (deepest: connect 93.184.216.34:443 failed",
-        case,
-    );
+    assert_explains(&run, "exit 22 (deepest: connect 93.184.216.34:443 failed", case);
     run.assert_row_count(1, case);
     // 下游消费者（第 2 步的 Read）被血缘链连上；它自己**没有**失败行。
     let _ = &sc;
-    assert_line(
-        &run,
-        case,
-        &["└─ output", "q3.pdf", "referenced later by step 2 Read"],
-    );
+    assert_line(&run, case, &["└─ output", "q3.pdf", "referenced later by step 2 Read"]);
     run.must_not_contain("tool.call Read step 2 \"", case);
     // 结果是错误、不是自述成功，所以不该冒出 `claim:` 两列。
     run.must_not_contain("claim:", case);
@@ -469,11 +449,7 @@ fn honest_failure_names_the_failed_producer_of_its_input() {
     assert_line(
         &run,
         case,
-        &[
-            "└─ input",
-            "r.pdf",
-            "produced by step 1 Bash (ERRORED: exit 22)",
-        ],
+        &["└─ input", "r.pdf", "produced by step 1 Bash (ERRORED: exit 22)"],
     );
 }
 
@@ -542,8 +518,7 @@ fn unlinked_write_tool_claim_is_unverified_not_mismatched() {
     let case = "dishonest-write-tool-claim";
     // 回放没有 live pid 可绑定 —— 这个钩子只影响会话级绑定，而本条调用没有
     // join key，所以它仍必须是"不核对"，而不是"对不上"。
-    let (run, _sc) =
-        Seed::load(case).run_with_env(&[("AGTRACE_TEST_FORCE_PID_LINKED", "1")]);
+    let (run, _sc) = Seed::load(case).run_with_env(&[("AGTRACE_TEST_FORCE_PID_LINKED", "1")]);
 
     run.assert_row_count(0, case);
     run.must_not_contain("!!", case);
@@ -621,8 +596,6 @@ fn write_tool_claim_without_kernel_is_unverified_not_mismatched() {
 // 三、循环故障（同一条命令重复 3 次，A.4 的 looping 模式）
 // ===============================================================
 
-
-
 /// 循环的第 3 次真的失败了：失败落在第 3 步，血缘说明"这个产物第 1 步就下过"。
 #[test]
 fn looping_fault_lands_on_the_last_repeat() {
@@ -681,11 +654,7 @@ fn a_pdf_that_smells_like_html_is_flagged_as_a_userspace_heuristic() {
     // 上游那一步在内核里是**成功**的（写 open 在），绝不能背上对不上账。
     run.must_not_contain("no write open observed", case);
     let _ = &sc;
-    assert_line(
-        &run,
-        case,
-        &["└─ input", "q3.pdf", "produced by step 1 Bash (ok)"],
-    );
+    assert_line(&run, case, &["└─ input", "q3.pdf", "produced by step 1 Bash (ok)"]);
     // 身份标签和结论必须落在**同一行**（长路径会把行尾吃掉，见 `lineage::sniff`）。
     assert_line(&run, case, &["userspace heuristic", "smells like HTML"]);
 }
@@ -784,8 +753,7 @@ fn json_header_is_structured_and_summary_is_last() {
         out.stdout
     );
     let parse = |l: &str| {
-        serde_json::from_str::<serde_json::Value>(l)
-            .unwrap_or_else(|e| panic!("invalid JSONL line ({e}): {l:?}"))
+        serde_json::from_str::<serde_json::Value>(l).unwrap_or_else(|e| panic!("invalid JSONL line ({e}): {l:?}"))
     };
 
     let header = parse(lines[0]);
@@ -800,9 +768,7 @@ fn json_header_is_structured_and_summary_is_last() {
         "header.target is still the raw text banner: {target:?}"
     );
     assert!(
-        header["sources"]
-            .as_array()
-            .is_some_and(|a| !a.is_empty()),
+        header["sources"].as_array().is_some_and(|a| !a.is_empty()),
         "sources must be populated for a replay run: {}",
         header["sources"]
     );
@@ -817,7 +783,10 @@ fn json_header_is_structured_and_summary_is_last() {
 
     for l in &lines[1..lines.len() - 1] {
         let ev = parse(l);
-        assert!(ev["kind"].is_string(), "every middle line is an event with a kind: {l:?}");
+        assert!(
+            ev["kind"].is_string(),
+            "every middle line is an event with a kind: {l:?}"
+        );
         assert!(ev["layer"].is_string(), "every event carries its layer: {l:?}");
     }
     let summary = parse(lines[lines.len() - 1]);
@@ -841,14 +810,7 @@ fn a_missing_kernel_file_is_an_error_not_an_empty_timeline() {
     );
     let missing = sc.dir.join("nope.txt").display().to_string();
     let out = Command::new(agtrace())
-        .args([
-            "--adapter",
-            "jsonl",
-            "-S",
-            &transcript,
-            "--kernel-lines",
-            &missing,
-        ])
+        .args(["--adapter", "jsonl", "-S", &transcript, "--kernel-lines", &missing])
         .output()
         .expect("cannot run the agtrace binary");
     assert!(!out.status.success(), "a missing capture must fail");

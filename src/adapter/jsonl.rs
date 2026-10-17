@@ -62,12 +62,7 @@ pub struct JsonlAdapter {
 }
 
 impl JsonlAdapter {
-    pub fn new(
-        path: &str,
-        tool_preview_max: usize,
-        follow: bool,
-        redact: RedactMode,
-    ) -> Result<Self, AdapterError> {
+    pub fn new(path: &str, tool_preview_max: usize, follow: bool, redact: RedactMode) -> Result<Self, AdapterError> {
         let p = std::path::Path::new(path);
         if !p.is_file() && !follow {
             return Err(AdapterError::NotFound(format!(
@@ -106,10 +101,7 @@ impl JsonlAdapter {
         match v.get("ts") {
             None => {
                 self.missing_ts += 1;
-                (
-                    Self::wall_now_ns(),
-                    vec!["ts missing: wall-clock at read".to_string()],
-                )
+                (Self::wall_now_ns(), vec!["ts missing: wall-clock at read".to_string()])
             }
             Some(Value::String(s)) => match parse_iso8601_ns(s) {
                 Some(ns) => (ns, Vec::new()),
@@ -222,13 +214,7 @@ impl JsonlAdapter {
                     self.call_tools.insert(id, tool.clone());
                 }
                 let bash_cmd = if tool == "Bash" {
-                    cmd.map(|c| {
-                        if self.redact.redacts_argv() {
-                            redact_text(&c)
-                        } else {
-                            c
-                        }
-                    })
+                    cmd.map(|c| if self.redact.redacts_argv() { redact_text(&c) } else { c })
                 } else {
                     None
                 };
@@ -248,8 +234,7 @@ impl JsonlAdapter {
                 let status = Self::str_field(v, "status").unwrap_or_else(|| "Unknown".into());
                 let output = Self::str_field(v, "output").unwrap_or_default();
                 let (p, n) = self.preview(&output, "output");
-                let tool = Self::str_field(v, "id")
-                    .and_then(|id| self.call_tools.get(&id).cloned());
+                let tool = Self::str_field(v, "id").and_then(|id| self.call_tools.get(&id).cloned());
                 Some((
                     Kind::AgentToolResult,
                     Payload::ToolResult {
@@ -261,10 +246,7 @@ impl JsonlAdapter {
                 ))
             }
             "model.request" => {
-                let (p, n) = self.preview(
-                    &Self::str_field(v, "detail").unwrap_or_default(),
-                    "detail",
-                );
+                let (p, n) = self.preview(&Self::str_field(v, "detail").unwrap_or_default(), "detail");
                 Some((
                     Kind::AgentModelRequest,
                     Payload::ModelRequest {
@@ -280,19 +262,17 @@ impl JsonlAdapter {
                 let (p, n) = self.preview(&text, "text");
                 Some((Kind::AgentModelText, Payload::ModelText { preview: p }, n))
             }
-            "model.usage" => {
-                Some((
-                    Kind::AgentModelUsage,
-                    Payload::ModelUsage {
-                        model: Self::str_field(v, "model"),
-                        input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()),
-                        output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()),
-                        cache_read: v.get("cache_read").and_then(|x| x.as_u64()),
-                        cost_usd: v.get("cost_usd").and_then(|x| x.as_f64()),
-                    },
-                    Vec::new(),
-                ))
-            }
+            "model.usage" => Some((
+                Kind::AgentModelUsage,
+                Payload::ModelUsage {
+                    model: Self::str_field(v, "model"),
+                    input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()),
+                    output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()),
+                    cache_read: v.get("cache_read").and_then(|x| x.as_u64()),
+                    cost_usd: v.get("cost_usd").and_then(|x| x.as_f64()),
+                },
+                Vec::new(),
+            )),
             "thinking" => {
                 let text = Self::str_field(v, "text").unwrap_or_default();
                 let (p, n) = self.preview(&text, "text");
@@ -377,11 +357,7 @@ impl EventAdapter for JsonlAdapter {
                 }
             }
             self.done = true;
-            return Ok(if n > 0 {
-                PollOutcome::Progress
-            } else {
-                PollOutcome::Eof
-            });
+            return Ok(if n > 0 { PollOutcome::Progress } else { PollOutcome::Eof });
         }
         let (lines, _gone) = self.tail.poll().map_err(|e| AdapterError::Io(e.to_string()))?;
         let mut n = 0usize;
@@ -505,23 +481,13 @@ mod tests {
 
     #[test]
     fn missing_file_offline_is_notfound() {
-        let r = JsonlAdapter::new(
-            "/tmp/agtrace_jsonl_nope_12345.jsonl",
-            512,
-            false,
-            RedactMode::Argv,
-        );
+        let r = JsonlAdapter::new("/tmp/agtrace_jsonl_nope_12345.jsonl", 512, false, RedactMode::Argv);
         assert!(matches!(r, Err(AdapterError::NotFound(_))));
     }
 
     #[test]
     fn missing_file_follow_is_allowed() {
-        let r = JsonlAdapter::new(
-            "/tmp/agtrace_jsonl_nope_12345.jsonl",
-            512,
-            true,
-            RedactMode::Argv,
-        );
+        let r = JsonlAdapter::new("/tmp/agtrace_jsonl_nope_12345.jsonl", 512, true, RedactMode::Argv);
         assert!(r.is_ok());
     }
 

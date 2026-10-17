@@ -253,10 +253,7 @@ mod tests {
         set(&mut r, 3, "1");
         let text = fmt(&r);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines[0],
-            "EXEC|1000|42|43|7|99|3|sleep|/usr/bin/sleep"
-        );
+        assert_eq!(lines[0], "EXEC|1000|42|43|7|99|3|sleep|/usr/bin/sleep");
         // Exactly `slots` rows, the empty ones included.
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[1], "ARGV|1000|42|43|0|sleep");

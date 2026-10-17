@@ -501,7 +501,10 @@ mod tests {
         assert_eq!(out.len(), 1, "collector end must be emitted immediately");
         let ev = &out[0];
         assert!(ev.ts_ns >= before, "ts_ns was not stamped: {}", ev.ts_ns);
-        assert!(ev.ts_wall_ns > 0, "collector end row has no wall time — renders as 0.000000");
+        assert!(
+            ev.ts_wall_ns > 0,
+            "collector end row has no wall time — renders as 0.000000"
+        );
         assert_eq!(ev.ts_wall_ns, m.clock.wall_from_mono(ev.ts_ns));
     }
 }

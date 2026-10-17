@@ -269,10 +269,8 @@ impl FileTail {
         let (meta_dev, meta_ino) = identity_of(&meta);
         let meta_len = meta.len();
 
-        let need_reopen = self.file.is_none()
-            || self.dev != meta_dev
-            || self.inode != meta_ino
-            || meta_len < self.offset;
+        let need_reopen =
+            self.file.is_none() || self.dev != meta_dev || self.inode != meta_ino || meta_len < self.offset;
 
         // 截断+重写可能整个发生在两次 poll 之间：长度已经长回旧 offset 以上，
         // `len < offset` 看不见。在信任 offset 之前，核对 offset 之前的一小段
@@ -391,11 +389,7 @@ impl FileTail {
 /// `Ok(false)` = 文件被截断后重写（且已长回旧 offset 以上），此时继续从旧
 /// offset 读会把新内容从中间切开。`read_at` 不移动文件游标。
 #[cfg(unix)]
-fn still_matches_tail(
-    f: &std::fs::File,
-    offset: u64,
-    tail: &[u8],
-) -> std::io::Result<bool> {
+fn still_matches_tail(f: &std::fs::File, offset: u64, tail: &[u8]) -> std::io::Result<bool> {
     use std::os::unix::fs::FileExt;
     let n = tail.len() as u64;
     if tail.is_empty() || offset < n {
@@ -411,11 +405,7 @@ fn still_matches_tail(
 }
 
 #[cfg(not(unix))]
-fn still_matches_tail(
-    _f: &std::fs::File,
-    _offset: u64,
-    _tail: &[u8],
-) -> std::io::Result<bool> {
+fn still_matches_tail(_f: &std::fs::File, _offset: u64, _tail: &[u8]) -> std::io::Result<bool> {
     Ok(true)
 }
 
@@ -496,7 +486,10 @@ mod tests {
         let mut t = FileTail::new(&p);
         let (lines, gone) = t.poll().unwrap();
         assert!(lines.is_empty());
-        assert!(!gone, "a file that was never seen must not be reported as a vanished source");
+        assert!(
+            !gone,
+            "a file that was never seen must not be reported as a vanished source"
+        );
         std::fs::write(&p, "hello\nworld\n").unwrap();
         assert_eq!(tail_lines(&mut t), vec!["hello".to_string(), "world".into()]);
         assert!(t.ever_opened);

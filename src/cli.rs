@@ -11,6 +11,7 @@
 //!   - **内核目标** `-p` / `-C` 互斥（都是内核层目标，同时给没有意义）；
 //!   - **agent 目标** `-S` 可选，可与内核目标**组合** → 这正是合并时间线；
 //!   - 一个目标都不给 → 报错退出（§4.1 的硬要求）。
+//!
 //! 这样 §4.1 的意图（必须有显式目标、不做全系统跟踪）和 §7 #3 都能满足。
 
 use crate::adapter::openshell::TimeBase;
@@ -165,10 +166,7 @@ impl CollectorBackend {
         match s {
             "aya" => Ok(CollectorBackend::Aya),
             "bpftrace" => Ok(CollectorBackend::Bpftrace),
-            other => Err(format!(
-                "unknown --collector `{}` (available: aya | bpftrace)",
-                other
-            )),
+            other => Err(format!("unknown --collector `{}` (available: aya | bpftrace)", other)),
         }
     }
 

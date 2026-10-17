@@ -62,12 +62,7 @@ pub fn loader_args(target: &Target, sources: &SourceFilter, argv_max: usize) -> 
             if !all.contains(root) {
                 all.push(*root);
             }
-            args.push(
-                all.iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
+            args.push(all.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
         }
         Target::Cgroup { id, .. } => {
             args.push("--mode".into());
@@ -207,7 +202,9 @@ fn describe(target: &Target, argv_max: usize, sources: &SourceFilter) -> String 
         sources.file as u8,
         sources.net as u8,
         ebpf::object_len(),
-        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "agtrace".into()),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "agtrace".into()),
         SUBCOMMAND
     )
 }
@@ -250,10 +247,7 @@ pub fn spawn_with_fallback(
             Ok(()) => match AyaCollector::spawn(target, argv_max, file_all, sources, redact) {
                 Ok(c) => return Ok((super::KernelCollector::Aya(c), None)),
                 Err(e) => {
-                    let note = format!(
-                        "the aya collector could not start ({}); falling back to bpftrace",
-                        e
-                    );
+                    let note = format!("the aya collector could not start ({}); falling back to bpftrace", e);
                     let b = super::bpftrace::BpftraceCollector::spawn(
                         template, target, argv_max, file_all, sources, redact, None,
                     )

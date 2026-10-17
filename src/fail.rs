@@ -96,7 +96,7 @@ const SETTLE_EOS: &str = "the stream ended without any kernel event linked to th
 const SETTLE_WATERMARK: &str = "the kernel stream moved past this result without linking anything to it";
 
 /// `--failures-only` 与外层知识的汇合点。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FailCfg {
     /// `--failures-only`：只放行失败链（失败调用 + 它的绑定子树 + 归因行）。
     pub only: bool,
@@ -118,17 +118,6 @@ pub struct FailCfg {
     /// `!! claim-mismatch`。现在它只用于把"没内核源"和"看了但没连上"分开计数
     /// （见 [`FailAttributor::claims_unverified_unlinked`]）。
     pub pid_linked: bool,
-}
-
-impl Default for FailCfg {
-    fn default() -> Self {
-        FailCfg {
-            only: false,
-            kernel_available: false,
-            settle_ns: 0,
-            pid_linked: false,
-        }
-    }
 }
 
 /// 一次失败的人读记录（footer 的 `--- failures (N)` 与 json 的 `extra.failures`）。
@@ -449,7 +438,11 @@ impl FailAttributor {
         if !self.decided_now(p) {
             return;
         }
-        let why = if self.cfg.kernel_available { SETTLE_LINKED } else { SETTLE_NO_SOURCE };
+        let why = if self.cfg.kernel_available {
+            SETTLE_LINKED
+        } else {
+            SETTLE_NO_SOURCE
+        };
         let p = self.pending.pop_back().unwrap();
         self.flush_failure(p, why, out);
     }
@@ -473,9 +466,7 @@ impl FailAttributor {
         }
         match p.kind {
             PendingKind::Fail => self.ev.get(&p.key).is_some_and(|e| e.kernel_events > 0),
-            PendingKind::Claim => {
-                self.kernel_watermark > p.src.ts_wall_ns.saturating_add(self.cfg.settle_ns)
-            }
+            PendingKind::Claim => self.kernel_watermark > p.src.ts_wall_ns.saturating_add(self.cfg.settle_ns),
         }
     }
 
@@ -565,10 +556,10 @@ impl FailAttributor {
         self.failures.push(f);
         // 定论之后这条调用不再收内核行 —— 归因行已经写死了它的结论。
         self.calls.remove(&p.key);
-        if self.cfg.only {
-            if let Some(mut chain) = self.chains.remove(&p.key) {
-                out.append(&mut chain);
-            }
+        if self.cfg.only
+            && let Some(mut chain) = self.chains.remove(&p.key)
+        {
+            out.append(&mut chain);
         }
         out.push(row);
     }
@@ -662,12 +653,20 @@ impl FailAttributor {
             .skip(1)
             .map(|c| claim_event(&p.src, &p.call, c))
             .collect();
-        let chain = if self.cfg.only { self.chains.remove(&p.key) } else { None };
+        let chain = if self.cfg.only {
+            self.chains.remove(&p.key)
+        } else {
+            None
+        };
         self.failures.push(f);
         self.calls.remove(&p.key);
         row.notes.push(format!(
             "claim vs kernel: {}; see the two columns in the head of this row",
-            if mismatched == 1 { "1 mismatch".to_string() } else { format!("{} mismatches", mismatched) }
+            if mismatched == 1 {
+                "1 mismatch".to_string()
+            } else {
+                format!("{} mismatches", mismatched)
+            }
         ));
         if let Some(mut chain) = chain {
             out.append(&mut chain);
@@ -782,7 +781,7 @@ impl FailAttributor {
                 None => ev.ts_wall_ns,
             });
         }
-        if ev.from_kernel_collector() || ev.is_collapse() {
+        if ev.produced_by_kernel_collector() || ev.is_collapse() {
             self.kernel_events_seen += 1;
             self.kernel_watermark = self.kernel_watermark.max(ev.ts_wall_ns);
             if ev.ts_wall_ns > 0 {
@@ -845,15 +844,15 @@ impl FailAttributor {
         self.seq += 1;
         let id = ev.corr.tool_use_id.clone();
         let key = call_key(&id, self.seq);
-        if self.calls.len() >= MAX_PENDING_CALLS {
-            if let Some(old) = self.order.pop_front() {
-                self.calls.remove(&old);
-                self.ev.remove(&old);
-                self.chains.remove(&old);
-                // 挂起中的也要丢：这条路径是为了给病态输入兜底，而不是为了
-                // 攒住几千条没结果的调用。
-                self.pending.retain(|p| p.key != old);
-            }
+        if self.calls.len() >= MAX_PENDING_CALLS
+            && let Some(old) = self.order.pop_front()
+        {
+            self.calls.remove(&old);
+            self.ev.remove(&old);
+            self.chains.remove(&old);
+            // 挂起中的也要丢：这条路径是为了给病态输入兜底，而不是为了
+            // 攒住几千条没结果的调用。
+            self.pending.retain(|p| p.key != old);
         }
         // v0.6 §14.1：每一次 `tool.call` 都在血缘表里占一步 —— 包括成功的那些，
         // 因为"第 12 步引用了第 3 步的产物"里的第 3 步，往往是一次成功的调用。
@@ -921,13 +920,13 @@ impl FailAttributor {
             }
             Payload::ProcExecFail { filename, errno, .. } => {
                 let base = basename(filename).unwrap_or_default();
-                push_capped(&mut e.exec_fail, (base, format!("exec {} {}", filename, errno_str(*errno))));
+                push_capped(
+                    &mut e.exec_fail,
+                    (base, format!("exec {} {}", filename, errno_str(*errno))),
+                );
             }
             Payload::FileOpen {
-                path,
-                ok: false,
-                errno,
-                ..
+                path, ok: false, errno, ..
             } => {
                 let s = if *errno == 0 {
                     // v0.4 之前的 fixture 没有 errno —— 不编造名字。
@@ -954,10 +953,7 @@ impl FailAttributor {
                 push_capped(&mut e.deep, (target, s));
             }
             Payload::PolicyDeny {
-                syscall,
-                target,
-                errno,
-                ..
+                syscall, target, errno, ..
             } => {
                 let s = format!("{} {} {}", syscall, target, errno_str(*errno));
                 push_capped(&mut e.deep, (target.clone(), s));
@@ -965,7 +961,11 @@ impl FailAttributor {
             Payload::ProcExit { exit_code } if *exit_code != 0 => {
                 push_capped(
                     &mut e.exits,
-                    format!("exit({}) at pid {}", exit_code, ev.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())),
+                    format!(
+                        "exit({}) at pid {}",
+                        exit_code,
+                        ev.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                    ),
                 );
             }
             _ => {}
@@ -990,8 +990,7 @@ impl FailAttributor {
         };
         // v0.6 §14.1：结果文本是血缘的第二半 —— 消费关系（"第 12 步引用了 X"）
         // 大多写在结果里（`read /tmp/report.pdf`、`loaded /tmp/x.json`）。
-        self.lineage
-            .on_result(&key, !verdict, lineage::error_note(text), text);
+        self.lineage.on_result(&key, !verdict, lineage::error_note(text), text);
         if !verdict {
             // 结果说它成功了。这里面有没有能被内核核对的话？（§14.2）
             //
@@ -1044,14 +1043,7 @@ impl FailAttributor {
             .cloned()
     }
 
-    fn build_failure(
-        &self,
-        ev: &Event,
-        call: &Call,
-        text: &str,
-        detected_by: String,
-        e: &Evidence,
-    ) -> Failure {
+    fn build_failure(&self, ev: &Event, call: &Call, text: &str, detected_by: String, e: &Evidence) -> Failure {
         let exit_code = exit_code_from_text(text);
         let sandbox = is_sandbox_init_error(text);
         let notfound = text.contains("command not found");
@@ -1152,10 +1144,10 @@ fn judge(status: &str, text: &str) -> (bool, String) {
 /// 刻意收得很紧：**任何一个成功的 Bash 结果里都可能出现 "Error"**（命令的输出），
 /// 所以这里只认 harness 自己会印的、且语义明确的三种形状。
 fn text_failure(text: &str) -> Option<String> {
-    if let Some(n) = exit_code_from_text(text) {
-        if n != 0 {
-            return Some(format!("text: Exit code {}", n));
-        }
+    if let Some(n) = exit_code_from_text(text)
+        && n != 0
+    {
+        return Some(format!("text: Exit code {}", n));
     }
     if text.contains("command not found") {
         return Some("text: command not found".into());
@@ -1211,11 +1203,7 @@ fn unbound_head(code: Option<i64>, why: &str) -> String {
 
 fn errno_str(e: i64) -> String {
     let n = errno_label(e);
-    if n == "?" {
-        format!("ERRNO({})", e)
-    } else {
-        n
-    }
+    if n == "?" { format!("ERRNO({})", e) } else { n }
 }
 
 /// 一条 `tool.call` 在归因器内部的键。
@@ -1246,7 +1234,8 @@ fn asked_for(subject: &str, argv: &HashSet<String>) -> bool {
     if subject.is_empty() {
         return false;
     }
-    argv.iter().any(|t| t == subject || (subject.len() >= 4 && t.contains(subject)))
+    argv.iter()
+        .any(|t| t == subject || (subject.len() >= 4 && t.contains(subject)))
 }
 
 fn basename(p: &str) -> Option<String> {
@@ -1285,7 +1274,10 @@ fn fail_event(src: &Event, call: &Call, f: &Failure, settle_note: &str) -> Event
         notes.push(format!("lineage (userspace inference, no kernel evidence): {}", l));
     }
     for s in &f.sniff {
-        notes.push(format!("content sniff (userspace heuristic, not kernel evidence): {}", s));
+        notes.push(format!(
+            "content sniff (userspace heuristic, not kernel evidence): {}",
+            s
+        ));
     }
     Event {
         seq: 0,
@@ -1520,8 +1512,14 @@ mod tests {
         let (_, f) = run(
             kernel_on(),
             vec![
-                call(1 * S, "t1", "Bash", "curl http://127.0.0.1:9/"),
-                result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 1\nbwrap: loopback: Failed RTM_NEWADDR"),
+                call(S, "t1", "Bash", "curl http://127.0.0.1:9/"),
+                result(
+                    2 * S,
+                    "t1",
+                    "Bash",
+                    "Failure",
+                    "Error: Exit code 1\nbwrap: loopback: Failed RTM_NEWADDR",
+                ),
             ],
         );
         assert_eq!(f.len(), 1);
@@ -1535,7 +1533,7 @@ mod tests {
         let (_, f) = run(
             kernel_on(),
             vec![
-                call(1 * S, "t1", "Bash", "foobarxyz123"),
+                call(S, "t1", "Bash", "foobarxyz123"),
                 result(
                     2 * S,
                     "t1",
@@ -1555,7 +1553,7 @@ mod tests {
         let (out, f) = run(
             kernel_on(),
             vec![
-                call(1 * S, "t1", "Bash", "cat /nonexistent-dir-abc"),
+                call(S, "t1", "Bash", "cat /nonexistent-dir-abc"),
                 exec_argv(2 * S, "t1", 42, "/usr/bin/cat", &["cat", "/nonexistent-dir-abc"]),
                 open_fail(3 * S, "t1", 42, "/nonexistent-dir-abc", -2),
                 exit_code(4 * S, "t1", 42, 2),
@@ -1577,9 +1575,7 @@ mod tests {
     /// PATH 探测的 ENOENT 不是失败：同一个 basename 后来 exec 成功了。
     #[test]
     fn path_probe_enoints_are_not_a_failure_cause() {
-        let mut evs = vec![
-            call(1 * S, "t1", "Bash", "git rev-parse HEAD"),
-        ];
+        let mut evs = vec![call(S, "t1", "Bash", "git rev-parse HEAD")];
         for (i, p) in ["/home/v/.cargo/bin/git", "/home/v/.nvm/git", "/home/v/.bun/bin/git"]
             .iter()
             .enumerate()
@@ -1601,7 +1597,13 @@ mod tests {
         evs.push(exec_ok(2 * S + 100, "t1", 42, "/usr/bin/git"));
         // 不在 git 仓库里 -> git 自己以 128 退出。这是**唯一**的真实失败点。
         evs.push(exit_code(3 * S, "t1", 42, 128));
-        evs.push(result(4 * S, "t1", "Bash", "Failure", "Error: Exit code 128\nfatal: not a git repository"));
+        evs.push(result(
+            4 * S,
+            "t1",
+            "Bash",
+            "Failure",
+            "Error: Exit code 128\nfatal: not a git repository",
+        ));
         let (_, f) = run(kernel_on(), evs);
         assert_eq!(f[0].class, CLASS_KERNEL);
         assert_eq!(
@@ -1628,7 +1630,7 @@ mod tests {
         );
         e.kind = Kind::RuntimeProcExec;
         let evs = vec![
-            call(1 * S, "t1", "Bash", "ls /nonexistent-dir-abc"),
+            call(S, "t1", "Bash", "ls /nonexistent-dir-abc"),
             e,
             open_fail(3 * S, "t1", 42, "/etc/ld.so.cache", -2),
             open_fail(4 * S, "t1", 42, "/nonexistent-dir-abc", -2),
@@ -1654,7 +1656,7 @@ mod tests {
     #[test]
     fn an_unrelated_failing_open_is_not_named_as_the_cause() {
         let evs = vec![
-            call(1 * S, "t1", "Bash", "ls /nonexistent-dir-abc"),
+            call(S, "t1", "Bash", "ls /nonexistent-dir-abc"),
             exec_argv(2 * S, "t1", 42, "/usr/bin/ls", &["ls", "/nonexistent-dir-abc"]),
             open_fail(3 * S, "t1", 42, "/etc/ld.so.cache", -2),
             open_fail(4 * S, "t1", 42, "/usr/share/locale/en/LC_MESSAGES/libc.mo", -2),
@@ -1673,7 +1675,7 @@ mod tests {
     /// 真正没跑起来的命令：exec_fail 之后**没有**成功的同 basename exec。
     #[test]
     fn exec_fail_without_a_successful_exec_is_a_cause() {
-        let mut evs = vec![call(1 * S, "t1", "Bash", "sh -c 'nosuchbinary'")];
+        let mut evs = vec![call(S, "t1", "Bash", "sh -c 'nosuchbinary'")];
         let mut e = kernel(
             2 * S,
             "t1",
@@ -1691,10 +1693,7 @@ mod tests {
         evs.push(result(4 * S, "t1", "Bash", "Failure", "Error: Exit code 127"));
         let (_, f) = run(kernel_on(), evs);
         assert_eq!(f[0].class, CLASS_KERNEL);
-        assert_eq!(
-            f[0].deepest.as_deref(),
-            Some("exec /usr/bin/nosuchbinary ENOENT")
-        );
+        assert_eq!(f[0].deepest.as_deref(), Some("exec /usr/bin/nosuchbinary ENOENT"));
     }
 
     #[test]
@@ -1702,7 +1701,7 @@ mod tests {
         let (out, f) = run(
             kernel_on(),
             vec![
-                call(1 * S, "t1", "Bash", "echo hi"),
+                call(S, "t1", "Bash", "echo hi"),
                 exec_ok(2 * S, "t1", 42, "/usr/bin/echo"),
                 exit_code(3 * S, "t1", 42, 0),
                 result(4 * S, "t1", "Bash", "Success", "stdout: hi"),
@@ -1732,9 +1731,20 @@ mod tests {
         let mut a = FailAttributor::new(cfg);
         // exec 先到（curl 起进程），结果随后 —— 这正是真实顺序。
         let out = a.process(vec![
-            call(1 * S, "t1", "Bash", "curl -s -o work/q3.pdf https://example.com/q3-revenue.pdf"),
-            exec_argv(1 * S, "t1", 42, "/usr/bin/curl", &["curl", "-s", "-o", "work/q3.pdf"]),
-            result(2 * S, "t1", "Bash", "Success", "stdout: Saved to /tmp/v06demo2/work/q3.pdf"),
+            call(
+                S,
+                "t1",
+                "Bash",
+                "curl -s -o work/q3.pdf https://example.com/q3-revenue.pdf",
+            ),
+            exec_argv(S, "t1", 42, "/usr/bin/curl", &["curl", "-s", "-o", "work/q3.pdf"]),
+            result(
+                2 * S,
+                "t1",
+                "Bash",
+                "Success",
+                "stdout: Saved to /tmp/v06demo2/work/q3.pdf",
+            ),
         ]);
         assert!(
             a.failures.is_empty(),
@@ -1764,15 +1774,30 @@ mod tests {
         };
         let mut a = FailAttributor::new(cfg);
         a.process(vec![
-            call(1 * S, "t1", "Bash", "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf ; echo Saved"),
-            exec_argv(1 * S, "t1", 42, "/usr/bin/curl", &["curl", "-s", "-o", "work/gone.pdf"]),
-            result(2 * S, "t1", "Bash", "Success", "stdout: Saved to /tmp/v06demo2/work/gone.pdf"),
+            call(
+                S,
+                "t1",
+                "Bash",
+                "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf ; echo Saved",
+            ),
+            exec_argv(S, "t1", 42, "/usr/bin/curl", &["curl", "-s", "-o", "work/gone.pdf"]),
+            result(
+                2 * S,
+                "t1",
+                "Bash",
+                "Success",
+                "stdout: Saved to /tmp/v06demo2/work/gone.pdf",
+            ),
         ]);
         assert!(a.failures.is_empty(), "还没等水印就下结论了");
         // 一条**别处**的内核行把水印推过 结果+窗口：现在可以说了。
         a.process(vec![exec_ok(3 * S, "t9", 99, "/usr/bin/true")]);
         assert_eq!(a.failures.len(), 1, "水印走过后仍然没有对账");
-        assert!(a.failures[0].head.contains("no write open observed"), "{}", a.failures[0].head);
+        assert!(
+            a.failures[0].head.contains("no write open observed"),
+            "{}",
+            a.failures[0].head
+        );
         assert!(a.failures[0].head.ends_with("!!"));
         assert_eq!(a.claims_mismatched, 1);
     }
@@ -1831,7 +1856,12 @@ mod tests {
             // 窗口左沿：属于别的调用，不挂在 t1 上。
             exec_ok(S, "t9", 99, "/usr/bin/true"),
             // t1 在窗口内发起；它说自己写了盘，内核侧却一条事件都没有。
-            call(2 * S, "t1", "Bash", "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf"),
+            call(
+                2 * S,
+                "t1",
+                "Bash",
+                "curl -s -o work/gone.pdf http://127.0.0.1:9/gone.pdf",
+            ),
             result(
                 3 * S,
                 "t1",
@@ -1843,20 +1873,17 @@ mod tests {
         let tail = a.finish();
         let all: Vec<&Event> = out.iter().chain(tail.iter()).collect();
         assert!(
-            all.iter().all(|e| e.kind != Kind::DerivedFail && e.kind != Kind::DerivedClaim),
+            all.iter()
+                .all(|e| e.kind != Kind::DerivedFail && e.kind != Kind::DerivedClaim),
             "没 join key 的调用不许产出 claim 对账行: {:?}",
             all.iter().map(|e| e.kind).collect::<Vec<_>>()
         );
         assert_eq!(a.claims_mismatched, 0, "没连上却说了'内核里没有'");
         assert!(a.failures.is_empty());
         assert_eq!(a.claims_unverified, 1);
-        assert_eq!(
-            a.claims_unverified_unlinked, 1,
-            "必须和'压根没看内核'分开计数"
-        );
+        assert_eq!(a.claims_unverified_unlinked, 1, "必须和'压根没看内核'分开计数");
         assert!(
-            a.claims_unverified_reason
-                .is_some_and(|r| r.contains("join key")),
+            a.claims_unverified_reason.is_some_and(|r| r.contains("join key")),
             "没资格核对时必须留下明确原因: {:?}",
             a.claims_unverified_reason
         );
@@ -1904,7 +1931,7 @@ mod tests {
                 pid_linked: false,
             },
             vec![
-                call(1 * S, "t1", "Bash", "curl -s -m 3 http://127.0.0.1:9/ ; echo \"exit=$?\""),
+                call(S, "t1", "Bash", "curl -s -m 3 http://127.0.0.1:9/ ; echo \"exit=$?\""),
                 result(2 * S, "t1", "Bash", "Success", "stdout: exit=7"),
             ],
         );
@@ -1923,7 +1950,7 @@ mod tests {
                 pid_linked: false,
             },
             vec![
-                call(1 * S, "t1", "Bash", "ls /x"),
+                call(S, "t1", "Bash", "ls /x"),
                 result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 2"),
             ],
         );
@@ -1941,7 +1968,7 @@ mod tests {
         let (_, f) = run(
             kernel_on(),
             vec![
-                call(1 * S, "t1", "Bash", "true"),
+                call(S, "t1", "Bash", "true"),
                 exec_ok(2 * S, "t1", 42, "/usr/bin/true"),
                 exit_code(3 * S, "t1", 42, 0),
                 result(4 * S, "t1", "Bash", "Failure", "Error: Exit code 2"),
@@ -1962,7 +1989,7 @@ mod tests {
         let evs = vec![
             // 一条与失败无关的模型行：必须被丢掉
             base(
-                1 * S,
+                S,
                 Kind::AgentModelRequest,
                 Layer::Agent,
                 Payload::ModelRequest {
@@ -2008,8 +2035,14 @@ mod tests {
         let (out, f) = run(
             cfg,
             vec![
-                call(1 * S, "t1", "Bash", "foobarxyz123"),
-                result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 127\ncommand not found"),
+                call(S, "t1", "Bash", "foobarxyz123"),
+                result(
+                    2 * S,
+                    "t1",
+                    "Bash",
+                    "Failure",
+                    "Error: Exit code 127\ncommand not found",
+                ),
             ],
         );
         assert_eq!(f.len(), 1);
@@ -2022,7 +2055,7 @@ mod tests {
             let mut a = FailAttributor::new(kernel_on());
             let _ = a.process(vec![
                 base(
-                    1 * S,
+                    S,
                     Kind::AgentModelRequest,
                     Layer::Agent,
                     Payload::ModelRequest {
@@ -2036,12 +2069,12 @@ mod tests {
             ]);
             a
         };
-        assert_eq!(a.origin_wall(), Some(T0 + 1 * S));
+        assert_eq!(a.origin_wall(), Some(T0 + S));
     }
 
     #[test]
     fn results_without_a_tool_use_id_still_pair_by_order() {
-        let mut c = call(1 * S, "t1", "Bash", "ls /x");
+        let mut c = call(S, "t1", "Bash", "ls /x");
         c.corr.tool_use_id = None;
         let mut r = result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 2");
         r.corr.tool_use_id = None;
@@ -2057,7 +2090,7 @@ mod tests {
     fn late_duplicate_result_never_resolves_another_call() {
         let mut a = FailAttributor::new(kernel_on());
         let out = a.process(vec![
-            call(1 * S, "c1", "Bash", "echo one"),
+            call(S, "c1", "Bash", "echo one"),
             result(2 * S, "c1", "Bash", "Success", "stdout: one"),
             call(3 * S, "c2", "Bash", "echo two"),
             // c1 已经 resolved，这条**同一个 id** 的重复结果以前会配给 c2。
@@ -2084,7 +2117,7 @@ mod tests {
         let (out, f) = run(
             kernel_on(),
             vec![
-                call(1 * S, "t1", "Bash", "cat /nonexistent-dir-abc"),
+                call(S, "t1", "Bash", "cat /nonexistent-dir-abc"),
                 result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 2\ncat: cannot access"),
                 // ↓ 结果之后才流出来的内核证据（真实顺序就是如此）
                 exec_argv(3 * S, "t1", 42, "/usr/bin/cat", &["cat", "/nonexistent-dir-abc"]),
@@ -2110,7 +2143,7 @@ mod tests {
     fn a_lonely_result_waits_until_the_stream_is_settled() {
         let mut a = FailAttributor::new(kernel_on());
         let out = a.process(vec![
-            call(1 * S, "t1", "Bash", "ls /x"),
+            call(S, "t1", "Bash", "ls /x"),
             result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 2"),
         ]);
         assert!(
@@ -2143,7 +2176,7 @@ mod tests {
         };
         let mut a = FailAttributor::new(cfg);
         let first = a.process(vec![
-            call(1 * S, "t1", "Bash", "ls /x"),
+            call(S, "t1", "Bash", "ls /x"),
             result(2 * S, "t1", "Bash", "Failure", "Error: Exit code 2"),
         ]);
         assert!(a.failures.is_empty(), "水位线还没动就下结论了: {first:?}");

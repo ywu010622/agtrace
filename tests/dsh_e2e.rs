@@ -77,13 +77,7 @@ fn dsh_session_renders_agent_timeline() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = make_session(&dir, false);
     let (ok, stdout, stderr) = run(
-        &[
-            "--adapter",
-            "dsh",
-            "-S",
-            path.to_str().unwrap(),
-            "--no-color",
-        ],
+        &["--adapter", "dsh", "-S", path.to_str().unwrap(), "--no-color"],
         &[],
         None,
     );
@@ -121,14 +115,7 @@ fn dsh_json_output_is_structured_and_lossless() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = make_session(&dir, false);
     let (ok, stdout, stderr) = run(
-        &[
-            "--adapter",
-            "dsh",
-            "-S",
-            path.to_str().unwrap(),
-            "--output",
-            "json",
-        ],
+        &["--adapter", "dsh", "-S", path.to_str().unwrap(), "--output", "json"],
         &[],
         None,
     );
@@ -176,14 +163,8 @@ fn dsh_max_events_caps_offline_output() {
         None,
     );
     assert!(ok, "stderr:\n{}", stderr);
-    let lines: Vec<serde_json::Value> = stdout
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let events = lines
-        .iter()
-        .filter(|l| l.get("agtrace").is_none())
-        .count();
+    let lines: Vec<serde_json::Value> = stdout.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let events = lines.iter().filter(|l| l.get("agtrace").is_none()).count();
     assert!(
         events <= 2,
         "--max-events must cap the emitted stream in offline/replay batches too, got {} events:\n{}",

@@ -164,7 +164,11 @@ fn build_ebpf(manifest_dir: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let built = dir.join("target").join(EBPF_TARGET).join("release").join("agtrace-ebpf");
+    let built = dir
+        .join("target")
+        .join(EBPF_TARGET)
+        .join("release")
+        .join("agtrace-ebpf");
     if !built.exists() {
         return Err(format!(
             "the eBPF build reported success but {} is missing",

@@ -66,10 +66,7 @@ pub fn precheck() -> Result<(), String> {
     if out.status.success() {
         return Ok(());
     }
-    Err(probe_failure(
-        out.status.code(),
-        &String::from_utf8_lossy(&out.stderr),
-    ))
+    Err(probe_failure(out.status.code(), &String::from_utf8_lossy(&out.stderr)))
 }
 
 /// Turn a failed probe into a reason that never comes back empty.
@@ -363,7 +360,7 @@ pub fn render_script(
     let file_pred = "1".to_string();
 
     let tpl = template
-        .replacen("@@SEEDS@@", &seeds.trim_end_matches('\n'), 1)
+        .replacen("@@SEEDS@@", seeds.trim_end_matches('\n'), 1)
         .replace("@@FILTER@@", &filter)
         .replace("@@ARGV_CAPTURE@@", capture.trim_end_matches('\n'))
         .replace("@@ARGV_PRINT@@", print.trim_end_matches('\n'))
@@ -486,10 +483,7 @@ pub fn cgroup_path_to_id(path: &str) -> Result<u64, String> {
             buf = vec![0u8; 8 + handle_len];
             continue;
         }
-        return Err(format!(
-            "name_to_handle_at({}) failed: {}",
-            path, err
-        ));
+        return Err(format!("name_to_handle_at({}) failed: {}", path, err));
     }
     let handle_bytes = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     if handle_bytes < 8 {

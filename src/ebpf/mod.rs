@@ -106,11 +106,22 @@ impl LoaderCfg {
             };
             match a.as_str() {
                 "--mode" => match take("--mode")?.as_str() {
-                    "pid-tree" => mode = Some(Mode::PidTree { root: 0, seeds: Vec::new() }),
+                    "pid-tree" => {
+                        mode = Some(Mode::PidTree {
+                            root: 0,
+                            seeds: Vec::new(),
+                        })
+                    }
                     "cgroup" => mode = Some(Mode::Cgroup { id: 0 }),
                     other => return Err(format!("unknown --mode `{}`", other)),
                 },
-                "--root" => root = Some(take("--root")?.parse().map_err(|_| "--root must be a pid".to_string())?),
+                "--root" => {
+                    root = Some(
+                        take("--root")?
+                            .parse()
+                            .map_err(|_| "--root must be a pid".to_string())?,
+                    )
+                }
                 "--seeds" => {
                     let v = take("--seeds")?;
                     seeds = v
@@ -120,14 +131,22 @@ impl LoaderCfg {
                         .collect::<Result<Vec<_>, _>>()?;
                 }
                 "--cgroup-id" => {
-                    cgroup = Some(take("--cgroup-id")?.parse().map_err(|_| "--cgroup-id must be a number".to_string())?)
+                    cgroup = Some(
+                        take("--cgroup-id")?
+                            .parse()
+                            .map_err(|_| "--cgroup-id must be a number".to_string())?,
+                    )
                 }
                 "--sources" => {
                     saw_sources = true;
-                    sources = take("--sources")?.parse().map_err(|_| "--sources must be a bitmask".to_string())?;
+                    sources = take("--sources")?
+                        .parse()
+                        .map_err(|_| "--sources must be a bitmask".to_string())?;
                 }
                 "--argv-max" => {
-                    argv_max = take("--argv-max")?.parse().map_err(|_| "--argv-max must be a number".to_string())?
+                    argv_max = take("--argv-max")?
+                        .parse()
+                        .map_err(|_| "--argv-max must be a number".to_string())?
                 }
                 other => return Err(format!("unknown loader argument `{}`", other)),
             }
@@ -155,7 +174,11 @@ impl LoaderCfg {
             },
             None => return Err("--mode is required".to_string()),
         };
-        Ok(LoaderCfg { mode, sources, argv_max })
+        Ok(LoaderCfg {
+            mode,
+            sources,
+            argv_max,
+        })
     }
 }
 
@@ -249,7 +272,8 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
         let tp: &mut TracePoint = p
             .try_into()
             .map_err(|e| format!("`{}` is not a tracepoint program: {}", prog, e))?;
-        tp.load().map_err(|e| format!("loading `{}` was rejected: {}", prog, e))?;
+        tp.load()
+            .map_err(|e| format!("loading `{}` was rejected: {}", prog, e))?;
         tp.attach(cat, name)
             .map_err(|e| format!("attaching `{}` to {}:{} failed: {}", prog, cat, name, e))?;
     }
@@ -310,7 +334,8 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
         if wrote {
             out.write_all(text.as_bytes())
                 .map_err(|e| format!("writing protocol output failed: {}", e))?;
-            out.flush().map_err(|e| format!("flushing protocol output failed: {}", e))?;
+            out.flush()
+                .map_err(|e| format!("flushing protocol output failed: {}", e))?;
             text.clear();
         }
 
@@ -351,13 +376,7 @@ pub fn run(cfg: &LoaderCfg) -> Result<(), String> {
 
 /// Print the exit summary on stderr. `stderr` is not part of the protocol; the
 /// parent scans it for the word `lost` (see `collector::child::parse_lost`).
-fn report(
-    cfg: &LoaderCfg,
-    lost: u64,
-    skipped: u64,
-    attach_ms: u128,
-    first_event_ms: Option<u128>,
-) {
+fn report(cfg: &LoaderCfg, lost: u64, skipped: u64, attach_ms: u128, first_event_ms: Option<u128>) {
     let target = match &cfg.mode {
         Mode::PidTree { root, seeds } => format!("pid-tree root={} seeds={}", root, seeds.len()),
         Mode::Cgroup { id } => format!("cgroup id={}", id),
@@ -595,7 +614,13 @@ mod tests {
         // Otherwise a `--pid` run whose /proc scan came back empty would attach
         // to an empty filter and produce a timeline of "nothing happened".
         let cfg = LoaderCfg::parse(&v(&["--mode", "pid-tree", "--root", "9", "--sources", "1"])).unwrap();
-        assert_eq!(cfg.mode, Mode::PidTree { root: 9, seeds: vec![9] });
+        assert_eq!(
+            cfg.mode,
+            Mode::PidTree {
+                root: 9,
+                seeds: vec![9]
+            }
+        );
     }
 
     #[test]
@@ -608,9 +633,22 @@ mod tests {
     #[test]
     fn missing_or_absurd_arguments_are_refused() {
         assert!(LoaderCfg::parse(&v(&[])).is_err(), "--mode is required");
-        assert!(LoaderCfg::parse(&v(&["--mode", "pid-tree", "--root", "1"])).is_err(), "--sources is required");
         assert!(
-            LoaderCfg::parse(&v(&["--mode", "pid-tree", "--root", "1", "--sources", "1", "--argv-max", "99"])).is_err(),
+            LoaderCfg::parse(&v(&["--mode", "pid-tree", "--root", "1"])).is_err(),
+            "--sources is required"
+        );
+        assert!(
+            LoaderCfg::parse(&v(&[
+                "--mode",
+                "pid-tree",
+                "--root",
+                "1",
+                "--sources",
+                "1",
+                "--argv-max",
+                "99"
+            ]))
+            .is_err(),
             "argv-max above what the eBPF side captures must not be accepted"
         );
         assert!(LoaderCfg::parse(&v(&["--mode", "nope", "--sources", "1"])).is_err());

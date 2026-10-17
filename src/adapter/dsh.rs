@@ -176,8 +176,12 @@ fn scan_zstd_frames(buffer: &[u8]) -> Result<ScanResult, String> {
                 torn_start: Some(start),
             });
         }
-        if u32::from_le_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]])
-            != ZSTD_MAGIC
+        if u32::from_le_bytes([
+            buffer[offset],
+            buffer[offset + 1],
+            buffer[offset + 2],
+            buffer[offset + 3],
+        ]) != ZSTD_MAGIC
         {
             return Err(format!(
                 "corrupt Zstandard session log: invalid frame magic at byte {}",
@@ -213,8 +217,7 @@ fn scan_zstd_frames(buffer: &[u8]) -> Result<ScanResult, String> {
         } else {
             1usize << content_size_flag
         };
-        let remaining_header_bytes =
-            usize::from(!single_segment) + dictionary_bytes + content_size_bytes;
+        let remaining_header_bytes = usize::from(!single_segment) + dictionary_bytes + content_size_bytes;
         if buffer.len() - offset < remaining_header_bytes {
             return Ok(ScanResult {
                 frames,
@@ -229,9 +232,8 @@ fn scan_zstd_frames(buffer: &[u8]) -> Result<ScanResult, String> {
                     torn_start: Some(start),
                 });
             }
-            let block_header = buffer[offset] as u32
-                | (buffer[offset + 1] as u32) << 8
-                | (buffer[offset + 2] as u32) << 16;
+            let block_header =
+                buffer[offset] as u32 | (buffer[offset + 1] as u32) << 8 | (buffer[offset + 2] as u32) << 16;
             offset += 3;
             let last_block = block_header & 1 != 0;
             let block_type = (block_header >> 1) & 3;
@@ -264,10 +266,7 @@ fn scan_zstd_frames(buffer: &[u8]) -> Result<ScanResult, String> {
             }
             offset += 4;
         }
-        frames.push(FrameSpan {
-            start,
-            end: offset,
-        });
+        frames.push(FrameSpan { start, end: offset });
     }
     Ok(ScanResult {
         frames,
@@ -518,9 +517,7 @@ fn encode_segment(raw: &str) -> String {
     for unit in raw.encode_utf16() {
         let ch = char::from_u32(unit as u32);
         match ch {
-            Some(c) if c != '~' && (c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') => {
-                out.push(c)
-            }
+            Some(c) if c != '~' && (c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') => out.push(c),
             _ => out.push_str(&format!("~{:04X}", unit)),
         }
     }
@@ -549,7 +546,9 @@ fn highest_generation(dir: &Path) -> Option<PathBuf> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(version) = parse_generation(name) else { continue };
+        let Some(version) = parse_generation(name) else {
+            continue;
+        };
         if best.as_ref().is_none_or(|(v, _)| version > *v) {
             best = Some((version, entry.path()));
         }
@@ -621,10 +620,7 @@ pub fn sessions_root() -> Option<PathBuf> {
 
 /// 把 Windows 路径写法与 WSL 写法都试一遍，返回第一个存在的目录。
 fn first_existing_path(path: &str) -> Option<PathBuf> {
-    cwd_variants(path)
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_dir())
+    cwd_variants(path).into_iter().map(PathBuf::from).find(|p| p.is_dir())
 }
 
 /// WSL: 从 `/mnt/<drive>/Users/*/.dsh/sessions` 找 Windows 侧 DSH 的会话根。
@@ -633,7 +629,9 @@ fn wsl_windows_sessions_root() -> Option<PathBuf> {
     let mut best: Option<(u64, PathBuf)> = None;
     for drive in ["c", "d", "e", "f"] {
         let users = PathBuf::from(format!("/mnt/{}/Users", drive));
-        let Ok(entries) = std::fs::read_dir(&users) else { continue };
+        let Ok(entries) = std::fs::read_dir(&users) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let sessions = entry.path().join(".dsh").join("sessions");
             if !sessions.is_dir() {
@@ -786,12 +784,11 @@ pub fn resolve_session(source: &str) -> Result<PathBuf, AdapterError> {
         // 在 DSH 的工具 shell 里运行时，harness 会导出 DSH_SESSION_ID /
         // DSH_HOME —— 于是 `agtrace --adapter dsh -S auto` 能精确找到**当前**
         // 会话，而不是"当前 workspace 里最新的一个"（两者在多会话并行时会不同）。
-        if let Ok(id) = std::env::var("DSH_SESSION_ID") {
-            if !id.trim().is_empty() {
-                if let Some(log) = find_session_by_id(&root, id.trim()) {
-                    return Ok(log);
-                }
-            }
+        if let Ok(id) = std::env::var("DSH_SESSION_ID")
+            && !id.trim().is_empty()
+            && let Some(log) = find_session_by_id(&root, id.trim())
+        {
+            return Ok(log);
         }
         if let Some(log) = newest_for_cwd(&root) {
             return Ok(log);
@@ -976,7 +973,10 @@ impl DshAdapter {
             parent_uuid: None,
             pid_root: None,
             pid_binding: None,
-            sidechain: data.get("delegationDepth").and_then(Value::as_u64).is_some_and(|d| d > 0),
+            sidechain: data
+                .get("delegationDepth")
+                .and_then(Value::as_u64)
+                .is_some_and(|d| d > 0),
         }
     }
 
@@ -1017,11 +1017,7 @@ impl DshAdapter {
             return;
         };
         let detail = data.get("detail").and_then(Value::as_str).map(str::to_string);
-        let status = data
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let status = data.get("status").and_then(Value::as_str).unwrap_or("").to_string();
         let cause = data.get("cause").and_then(Value::as_str).map(str::to_string);
         let exit_code = detail.as_deref().and_then(exit_code_marker);
         self.jobs.insert(
@@ -1111,29 +1107,29 @@ impl DshAdapter {
 
         // 推导 `agent.model.request`：DSH 没有独立的"请求开始"记录。时间戳是
         // 响应被记录的时刻，不是请求发出的时刻——这条 caveat 必须随行输出。
-        if let (Some(t), Some(s)) = (turn, step) {
-            if self.request_seen.insert((t, s)) {
-                let corr = self.corr(data, None);
-                out.push(agent_event(
-                    wall_ns,
-                    Kind::AgentModelRequest,
-                    Layer::Agent,
-                    "dsh",
-                    corr,
-                    Payload::ModelRequest {
-                        model: model.clone(),
-                        input_tokens: None,
-                        detail_preview: None,
-                    },
-                    Vec::new(),
-                    vec![
-                        "agent.model.request is **derived**: ts is when the assistant message was \
+        if let (Some(t), Some(s)) = (turn, step)
+            && self.request_seen.insert((t, s))
+        {
+            let corr = self.corr(data, None);
+            out.push(agent_event(
+                wall_ns,
+                Kind::AgentModelRequest,
+                Layer::Agent,
+                "dsh",
+                corr,
+                Payload::ModelRequest {
+                    model: model.clone(),
+                    input_tokens: None,
+                    detail_preview: None,
+                },
+                Vec::new(),
+                vec![
+                    "agent.model.request is **derived**: ts is when the assistant message was \
                          recorded, not when the request was sent (DESIGN.md §3.3/§5.2#6)"
-                            .to_string(),
-                    ],
-                ));
-                self.emitted += 1;
-            }
+                        .to_string(),
+                ],
+            ));
+            self.emitted += 1;
         }
 
         let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
@@ -1155,10 +1151,7 @@ impl DshAdapter {
                         Layer::Agent,
                         "dsh",
                         self.corr(data, None),
-                        Payload::Thinking {
-                            preview,
-                            duration_ms,
-                        },
+                        Payload::Thinking { preview, duration_ms },
                         note,
                         Vec::new(),
                     ));
@@ -1211,8 +1204,7 @@ impl DshAdapter {
             None => String::new(),
         };
         let input_bytes = args_raw.len();
-        let (input_preview, mut note) =
-            self.preview(&args_raw, self.cfg.tool_arg_max, "input_preview");
+        let (input_preview, mut note) = self.preview(&args_raw, self.cfg.tool_arg_max, "input_preview");
 
         let mut bash_cmd = None;
         if is_shell_tool(&name) {
@@ -1304,11 +1296,8 @@ impl DshAdapter {
         } else {
             "Success".to_string()
         };
-        let tool = call_id
-            .as_ref()
-            .and_then(|id| self.call_tools.get(id).cloned());
-        let (preview, trunc_notes) =
-            self.preview(&text, self.cfg.tool_arg_max, "result_preview");
+        let tool = call_id.as_ref().and_then(|id| self.call_tools.get(id).cloned());
+        let (preview, trunc_notes) = self.preview(&text, self.cfg.tool_arg_max, "result_preview");
         let corr = self.corr(data, call_id);
         out.push(agent_event(
             wall_ns,
@@ -1358,10 +1347,8 @@ fn exit_code_marker(text: &str) -> Option<i64> {
         let idx = from + i;
         // 只认 `[exit code: N]` / `exit code: N` / 行首 `exit code: N` 这种明确
         // 形状，避免把命令输出里随便一句 "exit code: …" 当成工具自己的总结。
-        let before_ok = idx == 0
-            || lower[..idx].ends_with('[')
-            || lower[..idx].ends_with(' ')
-            || lower[..idx].ends_with('\n');
+        let before_ok =
+            idx == 0 || lower[..idx].ends_with('[') || lower[..idx].ends_with(' ') || lower[..idx].ends_with('\n');
         if before_ok {
             let after = &text[idx + needle.len()..];
             let after = after.trim_start();
@@ -1417,11 +1404,7 @@ impl EventAdapter for DshAdapter {
             self.eof_done = true;
             let n = buf.len();
             out.append(&mut buf);
-            return Ok(if n > 0 {
-                PollOutcome::Progress
-            } else {
-                PollOutcome::Eof
-            });
+            return Ok(if n > 0 { PollOutcome::Progress } else { PollOutcome::Eof });
         }
 
         let (lines, gone) = self.log.poll()?;
@@ -1479,22 +1462,14 @@ impl EventAdapter for DshAdapter {
             ));
         }
         if !self.ignored_types.is_empty() {
-            let s: Vec<String> = self
-                .ignored_types
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
+            let s: Vec<String> = self.ignored_types.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             d.push(format!(
                 "harness-internal record type(s) (known, no event produced): {}",
                 s.join(" ")
             ));
         }
         if !self.unknown_types.is_empty() {
-            let s: Vec<String> = self
-                .unknown_types
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
+            let s: Vec<String> = self.unknown_types.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             d.push(format!(
                 "unknown record type(s) (counted, no event produced — forward compatible): {}",
                 s.join(" ")
@@ -1578,7 +1553,13 @@ mod tests {
         buf.extend(&f2);
         let scan = scan_zstd_frames(&buf).unwrap();
         assert_eq!(scan.frames.len(), 2);
-        assert_eq!(scan.frames[0], FrameSpan { start: 0, end: f1.len() });
+        assert_eq!(
+            scan.frames[0],
+            FrameSpan {
+                start: 0,
+                end: f1.len()
+            }
+        );
         assert_eq!(scan.torn_start, None);
 
         // 把第二帧切掉 2 字节：第一帧仍然完整，尾部是 tORN。
@@ -1623,7 +1604,11 @@ mod tests {
         let dir = std::env::temp_dir().join("agtrace_dsh_test_plain");
         let _ = std::fs::remove_dir_all(&dir);
         let h = header();
-        let c = call("call_1", "pwsh", r#"{"command":"ls /nonexistent-dir","description":"x"}"#);
+        let c = call(
+            "call_1",
+            "pwsh",
+            r#"{"command":"ls /nonexistent-dir","description":"x"}"#,
+        );
         let r = result("call_1", "ls: cannot access '/nonexistent-dir'\n[exit code: 2]", false);
         let path = session_file(&dir, false, &[&h, &c, &r]);
         let mut a = DshAdapter::new(path.to_str().unwrap(), AdapterCfg::default(), false).unwrap();
@@ -1644,15 +1629,20 @@ mod tests {
         }
         match &out[1].payload {
             Payload::ToolResult { status, tool, .. } => {
-                assert_eq!(status, "Failure", "non-zero [exit code] even with isError=false must be Failure");
+                assert_eq!(
+                    status, "Failure",
+                    "non-zero [exit code] even with isError=false must be Failure"
+                );
                 assert_eq!(tool.as_deref(), Some("pwsh"));
             }
             other => panic!("unexpected payload {:?}", other),
         }
-        assert!(out[1]
-            .notes
-            .iter()
-            .any(|n| n.contains("isError=false") && n.contains("exit code: 2")));
+        assert!(
+            out[1]
+                .notes
+                .iter()
+                .any(|n| n.contains("isError=false") && n.contains("exit code: 2"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1710,7 +1700,11 @@ mod tests {
             }
             other => panic!("unexpected {:?}", other),
         }
-        assert!(res.notes.iter().any(|n| n.contains("job/settled") && n.contains("exit code: 1")));
+        assert!(
+            res.notes
+                .iter()
+                .any(|n| n.contains("job/settled") && n.contains("exit code: 1"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1741,7 +1735,12 @@ mod tests {
             Payload::ToolResult { status, .. } => assert_eq!(status, "Failure"),
             other => panic!("unexpected {:?}", other),
         }
-        assert!(results[1].notes.iter().any(|n| n.contains("FsError") && n.contains("FS_STALE_VERSION")));
+        assert!(
+            results[1]
+                .notes
+                .iter()
+                .any(|n| n.contains("FsError") && n.contains("FS_STALE_VERSION"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -123,8 +123,7 @@ pub fn events_dir() -> Result<PathBuf, String> {
 /// Read and parse one tracepoint's `format` file.
 pub fn read_format(events: &std::path::Path, category: &str, name: &str) -> Result<EventFormat, String> {
     let path = events.join(category).join(name).join("format");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     parse(&text).map_err(|e| format!("cannot parse {}: {}", path.display(), e))
 }
 
@@ -216,19 +215,13 @@ pub fn resolve_type(ty: &str) -> Result<(u32, bool, bool), String> {
     let r = match t {
         "char" | "signed char" => (W1, true),
         "unsigned char" | "bool" | "_Bool" | "u8" => (W1, false),
-        "short" | "short int" | "signed short" | "signed short int" | "s16" | "int16_t" => {
-            (W2, true)
-        }
+        "short" | "short int" | "signed short" | "signed short int" | "s16" | "int16_t" => (W2, true),
         "unsigned short" | "unsigned short int" | "u16" | "uint16_t" | "umode_t" => (W2, false),
         "int" | "signed int" | "int32_t" | "s32" | "pid_t" | "key_t" => (W4, true),
-        "unsigned int" | "unsigned" | "uint32_t" | "u32" | "uid_t" | "gid_t" | "mode_t" => {
-            (W4, false)
-        }
-        "long" | "long int" | "signed long" | "int64_t" | "s64" | "loff_t" | "ssize_t"
-        | "__kernel_loff_t" | "time_t" => (W8, true),
-        "unsigned long" | "unsigned long int" | "uint64_t" | "u64" | "size_t" | "uptr" => {
-            (W8, false)
-        }
+        "unsigned int" | "unsigned" | "uint32_t" | "u32" | "uid_t" | "gid_t" | "mode_t" => (W4, false),
+        "long" | "long int" | "signed long" | "int64_t" | "s64" | "loff_t" | "ssize_t" | "__kernel_loff_t"
+        | "time_t" => (W8, true),
+        "unsigned long" | "unsigned long int" | "uint64_t" | "u64" | "size_t" | "uptr" => (W8, false),
         other => {
             return Err(format!(
                 "unsupported tracepoint field type `{}` — refusing to guess a width, because a \
@@ -286,7 +279,12 @@ format:
         // so it resolves to two bytes — not to the four the `mode` name suggests.
         assert_eq!(
             f.field("mode", "sys_enter_openat").unwrap(),
-            Field { offset: 40, width: agtrace_ebpf_common::W2, signed: false, data_loc: false }
+            Field {
+                offset: 40,
+                width: agtrace_ebpf_common::W2,
+                signed: false,
+                data_loc: false
+            }
         );
         let dl = f.field("__filename_val", "sys_enter_openat").unwrap();
         assert!(dl.data_loc);
@@ -328,8 +326,11 @@ format:
         match events_dir() {
             Ok(_) => {}
             Err(e) => {
-                assert!(!e.contains("is tracefs mounted and is CONFIG_FTRACE"),
-                        "unprivileged failure must not blame the kernel config first: {}", e);
+                assert!(
+                    !e.contains("is tracefs mounted and is CONFIG_FTRACE"),
+                    "unprivileged failure must not blame the kernel config first: {}",
+                    e
+                );
                 assert!(e.contains("not root"), "{}", e);
             }
         }

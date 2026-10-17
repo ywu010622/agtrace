@@ -67,7 +67,7 @@ pub fn read_proc(pid: u32) -> Option<ProcInfo> {
         .map(|p| p.to_string_lossy().to_string());
 
     let (ppid, start_ticks) = read_stat(pid, &base);
-    let start_wall_ns = start_ticks.and_then(|t| ticks_to_wall_ns(t));
+    let start_wall_ns = start_ticks.and_then(ticks_to_wall_ns);
 
     Some(ProcInfo {
         pid,
@@ -127,10 +127,10 @@ pub fn list_procs() -> Vec<u32> {
     if let Ok(rd) = std::fs::read_dir("/proc") {
         for e in rd.flatten() {
             let name = e.file_name();
-            if let Some(n) = name.to_str() {
-                if let Ok(p) = n.parse::<u32>() {
-                    v.push(p);
-                }
+            if let Some(n) = name.to_str()
+                && let Ok(p) = n.parse::<u32>()
+            {
+                v.push(p);
             }
         }
     }
@@ -156,10 +156,10 @@ fn looks_like_claude(p: &ProcInfo) -> bool {
 fn resume_session_id(cmdline: &[String]) -> Option<String> {
     let mut it = cmdline.iter();
     while let Some(a) = it.next() {
-        if a == "--resume" || a == "-r" {
-            if let Some(v) = it.next() {
-                return Some(v.clone());
-            }
+        if (a == "--resume" || a == "-r")
+            && let Some(v) = it.next()
+        {
+            return Some(v.clone());
         }
         if let Some(v) = a.strip_prefix("--resume=") {
             return Some(v.to_string());
@@ -202,18 +202,18 @@ pub fn resolve(
             if !looks_like_claude(&info) {
                 continue;
             }
-            if let Some(rid) = resume_session_id(&info.cmdline) {
-                if rid == sid {
-                    return BindingResult {
-                        level: Binding::Exact,
-                        pid: Some(pid),
-                        candidates: vec![pid],
-                        explanation: format!(
-                            "cmdline of pid {} contains `claude --resume {}`, equal to the transcript sessionId",
-                            pid, sid
-                        ),
-                    };
-                }
+            if let Some(rid) = resume_session_id(&info.cmdline)
+                && rid == sid
+            {
+                return BindingResult {
+                    level: Binding::Exact,
+                    pid: Some(pid),
+                    candidates: vec![pid],
+                    explanation: format!(
+                        "cmdline of pid {} contains `claude --resume {}`, equal to the transcript sessionId",
+                        pid, sid
+                    ),
+                };
             }
         }
     }
@@ -245,10 +245,10 @@ pub fn resolve(
             continue;
         }
         let mut reasons: Vec<&str> = Vec::new();
-        if let (Some(a), Some(b)) = (cwd, info.cwd.as_deref()) {
-            if a == b {
-                reasons.push("same cwd");
-            }
+        if let (Some(a), Some(b)) = (cwd, info.cwd.as_deref())
+            && a == b
+        {
+            reasons.push("same cwd");
         }
         if let (Some(t0), Some(st)) = (session_start_wall_ns, info.start_wall_ns) {
             // 进程必须在会话开始附近或之前启动。

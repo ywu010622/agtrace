@@ -248,9 +248,9 @@ impl ClaudeCodeAdapter {
             if let Some(t) = self.uuid_turn.get(cur) {
                 return Some(t.clone());
             }
-            match self.uuid_parent.get(cur) {
-                Some(p) => cur = p.as_str(),
-                None => return None,
+            {
+                let p = self.uuid_parent.get(cur)?;
+                cur = p.as_str()
             }
         }
         None
@@ -328,13 +328,14 @@ impl ClaudeCodeAdapter {
                     let (preview, mut note) = self.preview(&text, self.cfg.tool_arg_max, "result_preview");
                     // `toolUseResult` 类型不固定（实测 object/string/array 三种，§3.3）。
                     // 未知形状已经降级成 JSON 文本，这里再补一条说明。
-                    if let Some(tur) = v.get("toolUseResult") {
-                        if tur.is_object() && !is_known_result_shape(tur) {
-                            note.push(
-                                TruncNote::new("result_preview", None, preview.len())
-                                    .with_note("unknown toolUseResult shape -> degraded to JSON text (§3.3)"),
-                            );
-                        }
+                    if let Some(tur) = v.get("toolUseResult")
+                        && tur.is_object()
+                        && !is_known_result_shape(tur)
+                    {
+                        note.push(
+                            TruncNote::new("result_preview", None, preview.len())
+                                .with_note("unknown toolUseResult shape -> degraded to JSON text (§3.3)"),
+                        );
                     }
                     let notes: Vec<String> = Vec::new();
                     out.push(agent_event(
@@ -405,31 +406,31 @@ impl ClaudeCodeAdapter {
         }
 
         // usage：**按 message.id 去重**（见文件头修正 #2）。
-        if let (Some(id), Some(usage)) = (&msg_id, msg.and_then(|m| m.get("usage"))) {
-            if self.usage_seen.insert(id.clone()) {
-                let g = |k: &str| usage.get(k).and_then(|x| x.as_u64());
-                let corr = self.corr(v, uuid, None);
-                let notes: Vec<String> = Vec::new();
-                out.push(agent_event(
-                    wall_ns,
-                    Kind::AgentModelUsage,
-                    Layer::Agent,
-                    "claude-code",
-                    corr,
-                    Payload::ModelUsage {
-                        model: model.clone(),
-                        input_tokens: g("input_tokens"),
-                        output_tokens: g("output_tokens"),
-                        cache_read: g("cache_read_input_tokens"),
-                        // 不编造成本：transcript 里只有 cost-state 的**会话累计**快照，
-                        // 没有单次请求成本。§4.2 示例里的 cost= 在 v0 里不产出。
-                        cost_usd: None,
-                    },
-                    Vec::new(),
-                    notes,
-                ));
-                self.emitted += 1;
-            }
+        if let (Some(id), Some(usage)) = (&msg_id, msg.and_then(|m| m.get("usage")))
+            && self.usage_seen.insert(id.clone())
+        {
+            let g = |k: &str| usage.get(k).and_then(|x| x.as_u64());
+            let corr = self.corr(v, uuid, None);
+            let notes: Vec<String> = Vec::new();
+            out.push(agent_event(
+                wall_ns,
+                Kind::AgentModelUsage,
+                Layer::Agent,
+                "claude-code",
+                corr,
+                Payload::ModelUsage {
+                    model: model.clone(),
+                    input_tokens: g("input_tokens"),
+                    output_tokens: g("output_tokens"),
+                    cache_read: g("cache_read_input_tokens"),
+                    // 不编造成本：transcript 里只有 cost-state 的**会话累计**快照，
+                    // 没有单次请求成本。§4.2 示例里的 cost= 在 v0 里不产出。
+                    cost_usd: None,
+                },
+                Vec::new(),
+                notes,
+            ));
+            self.emitted += 1;
         }
 
         let Some(Value::Array(blocks)) = msg.and_then(|m| m.get("content")) else {
@@ -518,12 +519,9 @@ impl ClaudeCodeAdapter {
                     // 不产生歧义 —— v0.3 会拿这个字符串去和内核 argv 精确匹配，
                     // "猜"一个错的命令行会直接变成一条错误的 exact 断言。
                     let mut bash_cmd = None;
-                    if shell_tool
-                        && let Some(cmd) = raw_cmd
-                    {
+                    if shell_tool && let Some(cmd) = raw_cmd {
                         // 命令行字段：默认模式就按 argv 打码（F1）。
-                        let (c2, mut n2) =
-                            self.preview_argvish(cmd, self.cfg.bash_cmd_max, "bash_cmd");
+                        let (c2, mut n2) = self.preview_argvish(cmd, self.cfg.bash_cmd_max, "bash_cmd");
                         bash_cmd = Some(c2);
                         note.append(&mut n2);
                         // input_preview 保留完整 input（含其他字段如 timeout），
@@ -897,11 +895,7 @@ mod tests {
     /// `resolve_transcript()` 接受尚不存在的 `*.jsonl`（live tail 语义）；测试把
     /// 行直接喂给 `handle_line()`，不碰磁盘。
     fn adapter(mode: RedactMode) -> ClaudeCodeAdapter {
-        let p = std::env::temp_dir().join(format!(
-            "agtrace_cc_redact_{}_{:?}.jsonl",
-            std::process::id(),
-            mode
-        ));
+        let p = std::env::temp_dir().join(format!("agtrace_cc_redact_{}_{:?}.jsonl", std::process::id(), mode));
         ClaudeCodeAdapter::new(p.to_str().unwrap(), cfg(mode), true).expect("adapter")
     }
 
@@ -983,10 +977,7 @@ mod tests {
             other => panic!("unexpected payload: {:?}", other),
         }
         assert!(prompt_text(&evs).contains(SECRET), "argv 模式不得打码 prompt");
-        assert!(
-            result_preview(&evs).contains(SECRET),
-            "argv 模式不得打码 tool result"
-        );
+        assert!(result_preview(&evs).contains(SECRET), "argv 模式不得打码 tool result");
     }
 
     /// `--redact argv+content` 额外打码 agent 层内容；命令行仍然打码。
@@ -1005,11 +996,7 @@ mod tests {
             other => panic!("unexpected payload: {:?}", other),
         }
         assert!(!prompt_text(&evs).contains(SECRET), "{}", prompt_text(&evs));
-        assert!(
-            !result_preview(&evs).contains(SECRET),
-            "{}",
-            result_preview(&evs)
-        );
+        assert!(!result_preview(&evs).contains(SECRET), "{}", result_preview(&evs));
     }
 
     /// `--redact off` 必须真的不打码（用户显式关掉时不自作主张）。

@@ -545,10 +545,11 @@ pub fn match_rule(cmd: &str, cmd_truncated: bool, argv: &[String], argv_truncate
             return Some(RuleHit::Direct);
         }
         // 规则 S：cmd 陷在 `bash -c` 的载荷里。
-        if let Some(i) = shell_c_payload(argv) {
-            if !argv_truncated.contains(&i) && argv[i].contains(cmd) {
-                return Some(RuleHit::Substring);
-            }
+        if let Some(i) = shell_c_payload(argv)
+            && !argv_truncated.contains(&i)
+            && argv[i].contains(cmd)
+        {
+            return Some(RuleHit::Substring);
         }
     }
     // 规则 G：复合命令的某一段单独命中。只在真的被切开（≥2 段）时参与，
@@ -562,10 +563,10 @@ pub fn match_rule(cmd: &str, cmd_truncated: bool, argv: &[String], argv_truncate
                 continue;
             }
             let (tokens, unterminated) = shlex_split(seg);
-            if let Some((pct, _)) = token_overlap(&tokens, unterminated, argv) {
-                if pct >= TOKEN_OVERLAP_PCT {
-                    return Some(RuleHit::Segment);
-                }
+            if let Some((pct, _)) = token_overlap(&tokens, unterminated, argv)
+                && pct >= TOKEN_OVERLAP_PCT
+            {
+                return Some(RuleHit::Segment);
             }
         }
     }
@@ -791,10 +792,10 @@ impl ExactBinder {
     /// 属于一条已认领的调用时，整次工具调用就闭环了。
     fn stamp(&self, ev: &mut Event) {
         if ev.layer == Layer::Agent {
-            if let Some(id) = ev.corr.tool_use_id.as_deref() {
-                if self.matched_ids.contains(id) {
-                    ev.binding = Binding::Exact;
-                }
+            if let Some(id) = ev.corr.tool_use_id.as_deref()
+                && self.matched_ids.contains(id)
+            {
+                ev.binding = Binding::Exact;
             }
             return;
         }
@@ -810,12 +811,12 @@ impl ExactBinder {
             return;
         }
         // 还是没绑上：fork 行说的是"我创建了被绑定的子进程"，它属于这条链。
-        if let Payload::ProcFork { child_pid, .. } = &ev.payload {
-            if let Some(b) = self.bound.get(child_pid) {
-                ev.binding = Binding::Exact;
-                if ev.corr.tool_use_id.is_none() {
-                    ev.corr.tool_use_id = b.tool_use_id.clone();
-                }
+        if let Payload::ProcFork { child_pid, .. } = &ev.payload
+            && let Some(b) = self.bound.get(child_pid)
+        {
+            ev.binding = Binding::Exact;
+            if ev.corr.tool_use_id.is_none() {
+                ev.corr.tool_use_id = b.tool_use_id.clone();
             }
         }
     }
@@ -952,8 +953,8 @@ impl ExactBinder {
     /// 返回这一跳新增的绑定进程数（含 `pid` 自己，若它是新绑定的）。
     fn bind_pid(&mut self, pid: u32, info: Bound, scan_descendants: bool) -> u64 {
         let mut added = 0u64;
-        if !self.bound.contains_key(&pid) {
-            self.bound.insert(pid, info.clone());
+        if let std::collections::hash_map::Entry::Vacant(e) = self.bound.entry(pid) {
+            e.insert(info.clone());
             self.stats.pids_exact += 1;
             added += 1;
         }
@@ -976,8 +977,8 @@ impl ExactBinder {
                 break; // 环路防御：fork 关系理论上无环，但别让坏数据把循环卡死
             }
             for c in self.children.get(&p).cloned().unwrap_or_default() {
-                if !self.bound.contains_key(&c) {
-                    self.bound.insert(c, info.clone());
+                if let std::collections::hash_map::Entry::Vacant(e) = self.bound.entry(c) {
+                    e.insert(info.clone());
                     self.stats.pids_exact += 1;
                     added += 1;
                     stack.push(c);

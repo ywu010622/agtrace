@@ -19,9 +19,9 @@ mod redact;
 mod render;
 mod views;
 
+use cli::CollectorBackend;
 use cli::{Cli, OutputMode, Parsed};
 use collapse::{CollapseCfg, Collapser};
-use cli::CollectorBackend;
 use collector::Collector;
 use collector::KernelCollector;
 use collector::bpftrace::{SourceFilter, Target, scan_descendants};
@@ -296,8 +296,7 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                     bash_cmd_max: cli.bash_cmd_max,
                     redact: cli.redact,
                 };
-                let mut a =
-                    adapter::dsh::DshAdapter::new(src, cfg, cli.follow).map_err(|e| e.to_string())?;
+                let mut a = adapter::dsh::DshAdapter::new(src, cfg, cli.follow).map_err(|e| e.to_string())?;
                 // 启动时校验（§5.4 #4）：第一条记录必须是 DSH session 头。
                 a.validate().map_err(|e| e.to_string())?;
                 session_desc = Some(short_session_id(a.session_id.as_deref(), src));
@@ -307,25 +306,15 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 adapters.push(Box::new(a));
             }
             "openshell" => {
-                let a = adapter::openshell::OpenShellAdapter::new(
-                    src,
-                    cli.time_base,
-                    cli.tool_arg_max,
-                    cli.redact,
-                )
-                .map_err(|e| e.to_string())?;
+                let a = adapter::openshell::OpenShellAdapter::new(src, cli.time_base, cli.tool_arg_max, cli.redact)
+                    .map_err(|e| e.to_string())?;
                 // fixture 没有真正的会话标识，硬凑一个只会在表头里产生噪声。
                 target_desc = format!("openshell fixture {}", file_basename(src));
                 adapters.push(Box::new(a));
             }
             "jsonl" => {
-                let a = adapter::jsonl::JsonlAdapter::new(
-                    src,
-                    cli.tool_arg_max,
-                    cli.follow,
-                    cli.redact,
-                )
-                .map_err(|e| e.to_string())?;
+                let a = adapter::jsonl::JsonlAdapter::new(src, cli.tool_arg_max, cli.follow, cli.redact)
+                    .map_err(|e| e.to_string())?;
                 target_desc = format!("jsonl events {}", file_basename(src));
                 adapters.push(Box::new(a));
             }
@@ -549,7 +538,9 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
             }
         }
         // 回放的账：读了多少行、降级了几条，都进 `-v`（不静默）。
-        replay_stats = collector.as_ref().map(|c| (c.parse_stats().clone(), c.redacted_events()));
+        replay_stats = collector
+            .as_ref()
+            .map(|c| (c.parse_stats().clone(), c.redacted_events()));
     }
 
     // ---------------- 主循环 ----------------
@@ -569,72 +560,72 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         if QUIT.load(Ordering::SeqCst) {
             break;
         }
-        if let Some(d) = cli.duration_secs {
-            if start.elapsed() >= Duration::from_secs(d) {
-                break;
-            }
+        if let Some(d) = cli.duration_secs
+            && start.elapsed() >= Duration::from_secs(d)
+        {
+            break;
         }
-        if let Some(m) = cli.max_events {
-            if total_out >= m {
-                truncated_by_limit = true;
-                break;
-            }
+        if let Some(m) = cli.max_events
+            && total_out >= m
+        {
+            truncated_by_limit = true;
+            break;
         }
 
         // --- 内核 ---
         let mut kdone = collector.is_none() || replay_mode;
         if !replay_mode {
-        if let Some(c) = collector.as_mut() {
-            let mut evs = Vec::new();
-            match c.poll(&mut evs) {
-                Ok(PollOutcome::Eof) => kdone = true,
-                Ok(_) => kdone = c.exited(),
-                Err(e) => {
-                    let msg = e.to_string();
-                    // 采集器挂了必须**在时间线里**留下痕迹：只打到 stderr 的话，
-                    // 事后看时间线的人会以为这段时间"什么都没发生"（§4.3）。
-                    merger.push_collector_end(&msg);
-                    collector_failed = Some(msg);
-                    kdone = true;
-                }
-            }
-            for ev in evs {
-                // §4.1 --source 的 Rust 侧兜底过滤（脚本侧已按同一组开关裁剪，
-                // 这里是双保险，防止脚本模板出偏差时漏出不该有的 kind）。
-                if sources.allows(ev.kind) {
-                    merger.push_kernel(ev);
-                }
-            }
-        }
-
-        // --- agent ---
-        for (i, a) in adapters.iter_mut().enumerate() {
-            if agent_eof[i] {
-                continue;
-            }
-            let mut evs = Vec::new();
-            match a.poll(&mut evs) {
-                Ok(PollOutcome::Eof) => agent_eof[i] = true,
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("agtrace: adapter {} failed, stopping this source: {}", a.id(), e);
-                    agent_eof[i] = true;
-                }
-            }
-            // 只有声明 needs_pid_binding 的 adapter 才盖章 —— 给一个与进程树无关的
-            // fixture 盖上 binding 标记，等于凭空制造一个不存在的关联。
-            let stamp = a.capabilities().needs_pid_binding;
-            // `--source` 对 agent 层同样生效（§4.1）：`--source exec` 却打出 agent
-            // 行，横幅就会声称一个与屏幕不符的来源集合。
-            if sources.agent {
-                for mut ev in evs {
-                    if stamp {
-                        stamp_agent(&mut ev, &bind, cli);
+            if let Some(c) = collector.as_mut() {
+                let mut evs = Vec::new();
+                match c.poll(&mut evs) {
+                    Ok(PollOutcome::Eof) => kdone = true,
+                    Ok(_) => kdone = c.exited(),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // 采集器挂了必须**在时间线里**留下痕迹：只打到 stderr 的话，
+                        // 事后看时间线的人会以为这段时间"什么都没发生"（§4.3）。
+                        merger.push_collector_end(&msg);
+                        collector_failed = Some(msg);
+                        kdone = true;
                     }
-                    merger.push_agent(ev);
+                }
+                for ev in evs {
+                    // §4.1 --source 的 Rust 侧兜底过滤（脚本侧已按同一组开关裁剪，
+                    // 这里是双保险，防止脚本模板出偏差时漏出不该有的 kind）。
+                    if sources.allows(ev.kind) {
+                        merger.push_kernel(ev);
+                    }
                 }
             }
-        }
+
+            // --- agent ---
+            for (i, a) in adapters.iter_mut().enumerate() {
+                if agent_eof[i] {
+                    continue;
+                }
+                let mut evs = Vec::new();
+                match a.poll(&mut evs) {
+                    Ok(PollOutcome::Eof) => agent_eof[i] = true,
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("agtrace: adapter {} failed, stopping this source: {}", a.id(), e);
+                        agent_eof[i] = true;
+                    }
+                }
+                // 只有声明 needs_pid_binding 的 adapter 才盖章 —— 给一个与进程树无关的
+                // fixture 盖上 binding 标记，等于凭空制造一个不存在的关联。
+                let stamp = a.capabilities().needs_pid_binding;
+                // `--source` 对 agent 层同样生效（§4.1）：`--source exec` 却打出 agent
+                // 行，横幅就会声称一个与屏幕不符的来源集合。
+                if sources.agent {
+                    for mut ev in evs {
+                        if stamp {
+                            stamp_agent(&mut ev, &bind, cli);
+                        }
+                        merger.push_agent(ev);
+                    }
+                }
+            }
         } // !replay_mode：回放的两条流已在进循环前喂完
 
         merger.clock.maybe_resync();
@@ -1009,12 +1000,7 @@ fn lock_origin_if_filtered(cli: &Cli, failer: &FailAttributor, r: &mut TextRende
 /// 这里曾经把 text 横幅整段塞进 JSON 的 `target` 字段（session/binding/sources/
 /// notes 全是空的），下游按 `json` 解析时拿到的是带换行的人类文本 —— 这是
 /// `--output json` 契约的破坏，必须在唯一的写出点修掉，而不是各写各的。
-fn write_out<W: Write>(
-    w: &mut W,
-    cli: &Cli,
-    header: &Header,
-    rendered_text: &str,
-) -> Result<(), String> {
+fn write_out<W: Write>(w: &mut W, cli: &Cli, header: &Header, rendered_text: &str) -> Result<(), String> {
     let line = match cli.output {
         OutputMode::Text => format!("{}\n", rendered_text),
         OutputMode::Json => format!(
@@ -1043,6 +1029,8 @@ fn fnv1a(b: &[u8]) -> u64 {
     h
 }
 
+// `-v` 的逐项转储天然对应一长串数据源；拆成结构体只会让调用点更长。
+#[allow(clippy::too_many_arguments)]
 fn print_diagnostics(
     cli: &Cli,
     summary: &Summary,
@@ -1262,11 +1250,7 @@ fn short_session_id(id: Option<&str>, fallback: &str) -> String {
         Some(s) => {
             let rest = s.strip_prefix("session-").unwrap_or(s);
             let take: String = rest.chars().take(8).collect();
-            if take.is_empty() {
-                s.to_string()
-            } else {
-                take
-            }
+            if take.is_empty() { s.to_string() } else { take }
         }
         None => fallback.to_string(),
     }

@@ -59,7 +59,11 @@ pub fn struct_member_offset(data: &[u8], struct_name: &str, member: &str) -> Res
         if off >= strs.len() {
             return Err(format!("BTF string offset {} is out of range", off));
         }
-        let end = strs[off..].iter().position(|&b| b == 0).map(|p| off + p).unwrap_or(strs.len());
+        let end = strs[off..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| off + p)
+            .unwrap_or(strs.len());
         Ok(std::str::from_utf8(&strs[off..end]).unwrap_or("<non-utf8>"))
     };
 

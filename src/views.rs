@@ -381,7 +381,7 @@ impl Views {
 
     pub fn observe(&mut self, ev: &mut Event) {
         self.last_event_ts = self.last_event_ts.max(ev.ts_ns);
-        if ev.from_kernel_collector() {
+        if ev.produced_by_kernel_collector() {
             self.kernel_events_seen += 1;
             // 内核观测窗口的左边界 = 第一条内核事件。注意事件是**乱序**进入
             // observe 的（merger 的重排窗口），所以取最小值而不是"第一次见到的"。
@@ -392,14 +392,13 @@ impl Views {
         }
         // 内核 net.connect 先记账 —— 楔形判定要用，且必须在 agent 事件之前更新，
         // 否则同一批里"先 connect 后 result"的合法顺序会被判成楔形。
-        if ev.kind == Kind::InfraNetConnect {
-            if let Payload::NetConnect { ok, .. } = &ev.payload {
-                if *ok {
-                    self.recent_connects.push_back(ev.ts_ns);
-                    self.all_connects.push(ev.ts_ns);
-                    self.trim_connects(ev.ts_ns);
-                }
-            }
+        if ev.kind == Kind::InfraNetConnect
+            && let Payload::NetConnect { ok, .. } = &ev.payload
+            && *ok
+        {
+            self.recent_connects.push_back(ev.ts_ns);
+            self.all_connects.push(ev.ts_ns);
+            self.trim_connects(ev.ts_ns);
         }
 
         if self.cfg.enable_watch {
@@ -532,41 +531,41 @@ impl Views {
         }
 
         // ---- §10.3 楔形：说成功，但内核侧没有对应的外联 ----
-        if self.cfg.enable_gap {
-            if let Some(cmd) = &p.bash_cmd {
-                let status_ok = match &ev.payload {
-                    Payload::ToolResult { status, .. } => {
-                        let s = status.to_ascii_lowercase();
-                        !(s.contains("error") || s.contains("fail") || s.contains("denied"))
-                    }
-                    _ => false,
-                };
-                // **没有内核源时绝不做楔形判定。**
-                //
-                // 楔形的断言是"命令报告成功，但内核里没有对应的 connect"。如果这次
-                // 运行压根没有内核采集器（纯 `-S` 读 transcript），那"没有 connect"
-                // 是必然的、无信息的 —— 对它报警等于把"我没在看"说成"它没发生"。
-                // §4.3 允许说"不知道"，不允许把不知道包装成发现。
-                // 第三个前提：agent 会话与内核进程树必须**真有关联**。
-                //
-                // 楔形的结论是"内核里没有对应的 connect"。如果 pid_binding 是 None，
-                // 我们看的进程树和这个会话之间没有任何证据链 —— 在那棵树上没看到
-                // connect，与"这个命令没联网"是两件不相干的事。§3.5 说绑不上就要
-                // 说绑不上；那么在绑不上的基础上做跨层推断，更是不能做的事。
-                let linked = matches!(
-                    ev.corr.pid_binding,
-                    Some(crate::event::Binding::Exact) | Some(crate::event::Binding::Heuristic)
-                );
-                if status_ok && linked && expects_network(cmd) {
-                    // 只**登记候选**，不在这里下结论 —— 见 `finish()`。
-                    self.wedge_candidates.push(WedgeCandidate {
-                        call_ts: p.ts_ns,
-                        result_ts: ev.ts_ns,
-                        cmd: cmd.to_string(),
-                        binding: ev.corr.pid_binding,
-                        src: ev.clone(),
-                    });
+        if self.cfg.enable_gap
+            && let Some(cmd) = &p.bash_cmd
+        {
+            let status_ok = match &ev.payload {
+                Payload::ToolResult { status, .. } => {
+                    let s = status.to_ascii_lowercase();
+                    !(s.contains("error") || s.contains("fail") || s.contains("denied"))
                 }
+                _ => false,
+            };
+            // **没有内核源时绝不做楔形判定。**
+            //
+            // 楔形的断言是"命令报告成功，但内核里没有对应的 connect"。如果这次
+            // 运行压根没有内核采集器（纯 `-S` 读 transcript），那"没有 connect"
+            // 是必然的、无信息的 —— 对它报警等于把"我没在看"说成"它没发生"。
+            // §4.3 允许说"不知道"，不允许把不知道包装成发现。
+            // 第三个前提：agent 会话与内核进程树必须**真有关联**。
+            //
+            // 楔形的结论是"内核里没有对应的 connect"。如果 pid_binding 是 None，
+            // 我们看的进程树和这个会话之间没有任何证据链 —— 在那棵树上没看到
+            // connect，与"这个命令没联网"是两件不相干的事。§3.5 说绑不上就要
+            // 说绑不上；那么在绑不上的基础上做跨层推断，更是不能做的事。
+            let linked = matches!(
+                ev.corr.pid_binding,
+                Some(crate::event::Binding::Exact) | Some(crate::event::Binding::Heuristic)
+            );
+            if status_ok && linked && expects_network(cmd) {
+                // 只**登记候选**，不在这里下结论 —— 见 `finish()`。
+                self.wedge_candidates.push(WedgeCandidate {
+                    call_ts: p.ts_ns,
+                    result_ts: ev.ts_ns,
+                    cmd: cmd.to_string(),
+                    binding: ev.corr.pid_binding,
+                    src: ev.clone(),
+                });
             }
         }
 
@@ -613,10 +612,10 @@ impl Views {
                             }
                         }
                         WatchKind::NetPort => {
-                            if let Some(p) = port {
-                                if r.pattern.trim() == p.to_string() {
-                                    hits.push((i, format!("port {}", p)));
-                                }
+                            if let Some(p) = port
+                                && r.pattern.trim() == p.to_string()
+                            {
+                                hits.push((i, format!("port {}", p)));
                             }
                         }
                         _ => {}
@@ -646,10 +645,10 @@ impl Views {
                                 hits.push((i, crate::event::truncate_chars(cmd, 120, 120).0));
                             }
                         }
-                        WatchKind::ToolArg => {
-                            if glob_match(&r.pattern, cmd) || glob_match(&r.pattern, input_preview) {
-                                hits.push((i, crate::event::truncate_chars(cmd, 120, 120).0));
-                            }
+                        WatchKind::ToolArg
+                            if (glob_match(&r.pattern, cmd) || glob_match(&r.pattern, input_preview)) =>
+                        {
+                            hits.push((i, crate::event::truncate_chars(cmd, 120, 120).0));
                         }
                         _ => {}
                     }
@@ -752,11 +751,11 @@ impl Views {
             //
             // 取 call_ts 而非窗口与观测窗口的**交叠**：只要调用的起点在观测窗口之前，
             // 我们就无法排除"connect 发生在开始看之前那一瞬"，所以整条候选作废。
-            if let Some(f) = first {
-                if c.call_ts < f {
-                    self.wedge_skipped_precollection += 1;
-                    continue;
-                }
+            if let Some(f) = first
+                && c.call_ts < f
+            {
+                self.wedge_skipped_precollection += 1;
+                continue;
             }
             // 允许 result 落盘比内核事件晚一点（transcript 是事后写的）。
             let lo = c.call_ts;
@@ -914,10 +913,10 @@ fn expects_network(cmd: &str) -> bool {
         if ALWAYS_NET.contains(&base) {
             return true;
         }
-        if let Some((_, subs)) = NET_SUBCMD.iter().find(|(t, _)| *t == base) {
-            if subs.contains(&second) {
-                return true;
-            }
+        if let Some((_, subs)) = NET_SUBCMD.iter().find(|(t, _)| *t == base)
+            && subs.contains(&second)
+        {
+            return true;
         }
     }
     false
@@ -1179,7 +1178,7 @@ mod tests {
         let mut c = call(0, "t1", "Read", None);
         c.corr.tool_use_id = None;
         v.observe(&mut c);
-        let mut r = result(1 * S, "t2", "Read", "success");
+        let mut r = result(S, "t2", "Read", "success");
         r.corr.tool_use_id = None;
         v.observe(&mut r);
         assert_eq!(v.finish().len(), 0, "同工具的无 id 结果没配上");
@@ -1362,7 +1361,7 @@ mod tests {
         let mut v = views_with_kernel();
         let mut c = exact("t1", "curl -s https://example.com", 0);
         v.observe(&mut c);
-        let mut conn = result(1 * S, "c1", "Bash", "ok");
+        let mut conn = result(S, "c1", "Bash", "ok");
         conn.kind = Kind::InfraNetConnect;
         conn.layer = Layer::Infra;
         conn.payload = Payload::NetConnect {
@@ -1402,7 +1401,7 @@ mod tests {
         // 历史调用：0s 发出、1s 成功，那时还没开始看内核
         let mut c = exact("t1", "curl -s https://example.com", 0);
         v.observe(&mut c);
-        let mut r = exact_result(1 * S, "t1", "success");
+        let mut r = exact_result(S, "t1", "success");
         v.observe(&mut r);
         // 内核采集 100s 才起来（这条事件同时定义了观测窗口左边界）
         let mut k = result(100 * S, "k1", "Bash", "ok");

@@ -75,6 +75,7 @@ impl TsSource {
 ///    `exact`（§3.5 三级），agent 行继承会话级等级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Binding {
     /// 一级：`/proc/<pid>/cmdline` 里含 `claude --resume <sessionId>` 且 sessionId 相等。
     /// 三级：exec argv 与 tool.call 的 shell 命令按 §3.5 的规则精确匹配上（含子树）。
@@ -83,13 +84,8 @@ pub enum Binding {
     /// 三级：只有会话级绑定，没有 tool.call 级证据 —— prompt/model/thinking 就在这一档。
     Heuristic,
     /// 绑不上。时间线仍然输出，但关联只是"时间邻近"不是"因果同一"。
+    #[default]
     None,
-}
-
-impl Default for Binding {
-    fn default() -> Self {
-        Binding::None
-    }
 }
 
 impl Binding {
@@ -706,7 +702,7 @@ impl Event {
     /// agent 层事件在本地 tail 时也可能带 Kernel 时间戳。要判断"我们到底有没有在
     /// 看内核"，只能看层，不能看时间戳来源 —— 否则一个纯 `-S` 运行会被误判成
     /// "内核在采"，进而允许做出"内核里没有 X"这种无根据的断言。
-    pub fn from_kernel_collector(&self) -> bool {
+    pub fn produced_by_kernel_collector(&self) -> bool {
         matches!(self.layer, Layer::Runtime | Layer::Infra | Layer::Policy)
     }
 
@@ -769,14 +765,12 @@ pub fn truncate_chars(s: &str, max_bytes: usize, max_chars: usize) -> (String, b
     }
     // 先按字符数切，再确保字节数不超限 —— 两者取更严的。
     let mut end = 0usize;
-    let mut nchars = 0usize;
-    for (i, c) in s.char_indices() {
+    for (nchars, (i, c)) in s.char_indices().enumerate() {
         let next = i + c.len_utf8();
         if next > max_bytes || nchars + 1 > max_chars {
             break;
         }
         end = next;
-        nchars += 1;
     }
     // 若第一个字符本身就超限，至少保留它 —— 否则会产出空串掩盖信息。
     if end == 0 && !s.is_empty() {

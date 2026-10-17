@@ -208,7 +208,14 @@ impl LineChild {
             if !matches!(st.code(), Some(0)) {
                 // The child may have written its reason just before dying.
                 self.drain_stderr();
-                let tail: Vec<&str> = self.stderr_tail.iter().rev().take(3).rev().map(String::as_str).collect();
+                let tail: Vec<&str> = self
+                    .stderr_tail
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .rev()
+                    .map(String::as_str)
+                    .collect();
                 let tail = if tail.is_empty() {
                     "(no stderr output)".to_string()
                 } else {
@@ -219,10 +226,7 @@ impl LineChild {
                     None => "killed by signal".to_string(),
                 };
                 let detail = tail.chars().take(400).collect::<String>();
-                return Err(CollectorError::Io(format!(
-                    "{} {}: {}",
-                    self.label, status, detail
-                )));
+                return Err(CollectorError::Io(format!("{} {}: {}", self.label, status, detail)));
             }
         }
 
@@ -380,10 +384,7 @@ mod tests {
     fn lost_is_parsed_from_both_dialects() {
         assert_eq!(parse_lost("Lost 142 events"), Some(142));
         assert_eq!(parse_lost("agtrace-ebpf: lost 7 events (ring buffer full)"), Some(7));
-        assert_eq!(
-            parse_lost(r#"{"type": "lost_events", "data": {"lost": 9}}"#),
-            Some(9)
-        );
+        assert_eq!(parse_lost(r#"{"type": "lost_events", "data": {"lost": 9}}"#), Some(9));
     }
 
     #[test]
@@ -412,7 +413,12 @@ mod tests {
             .filter_map(|l| l.split('=').next().map(|s| s.to_string()))
             .collect();
         for k in &keys {
-            assert!(KEEP_ENV.contains(&k.as_str()), "子进程继承了 {:?}（全部：{:?}）", k, keys);
+            assert!(
+                KEEP_ENV.contains(&k.as_str()),
+                "子进程继承了 {:?}（全部：{:?}）",
+                k,
+                keys
+            );
         }
     }
 
@@ -423,10 +429,7 @@ mod tests {
         let mut cmd = Command::new("sudo");
         scrub_env(&mut cmd);
         cmd.env("BPFTRACE_MAX_STRLEN", "200");
-        let explicit: Vec<String> = cmd
-            .get_envs()
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
+        let explicit: Vec<String> = cmd.get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
         assert!(
             explicit.iter().any(|k| k == "BPFTRACE_MAX_STRLEN"),
             "调用方设的变量被抹掉了: {:?}",
@@ -459,10 +462,7 @@ mod tests {
     #[test]
     fn a_nonzero_child_exit_is_a_capture_failure_not_an_eof() {
         let mut cmd = Command::new("bash");
-        cmd.args([
-            "-c",
-            "echo 'sudo: a password is required' >&2; echo boom >&2; exit 3",
-        ]);
+        cmd.args(["-c", "echo 'sudo: a password is required' >&2; echo boom >&2; exit 3"]);
         let (failure, _) = drain_fake_child(cmd);
         let msg = failure.expect("non-zero child exit must surface as Err, not clean Eof");
         assert!(msg.contains("exit status 3"), "{}", msg);

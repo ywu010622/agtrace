@@ -111,8 +111,28 @@ fn is_url_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
             c,
-            '/' | '.' | '_' | '-' | '~' | ':' | '?' | '#' | '[' | ']' | '@' | '!' | '$' | '&'
-                | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '=' | '%'
+            '/' | '.'
+                | '_'
+                | '-'
+                | '~'
+                | ':'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
         )
 }
 
@@ -132,7 +152,9 @@ const PATH_DENY: &[&str] = &[
 ];
 
 fn denied(path: &str) -> bool {
-    PATH_DENY.iter().any(|d| path == *d || path.starts_with(&format!("{}/", d)))
+    PATH_DENY
+        .iter()
+        .any(|d| path == *d || path.starts_with(&format!("{}/", d)))
 }
 
 /// 从一段文本里抽产物。顺序 = 出现顺序（稳定），去重，最多 [`MAX_ARTIFACTS`] 个。
@@ -235,11 +257,7 @@ pub fn extract(text: &str) -> Vec<Artifact> {
         // 就是项目根），只认绝对路径等于血缘在真机上永远连不起来 —— acceptance #4
         // 第一次跑出来的就是"一条链都没有"。同一个 cwd 下重复出现的同一个相对
         // 字符串，和绝对路径一样是可对齐的。
-        let word_start = i == 0
-            || !text[..i]
-                .chars()
-                .next_back()
-                .is_some_and(is_path_char);
+        let word_start = i == 0 || !text[..i].chars().next_back().is_some_and(is_path_char);
         if word_start && is_path_char(text[i..].chars().next().unwrap_or('\0')) {
             let mut j = i;
             for c in text[i..end].chars() {
@@ -290,9 +308,7 @@ fn looks_like_a_file(path: &str) -> bool {
 /// `https://user:pw@host:8443/path?q=1` → `host`。取不到时 `None`
 /// （例如 `http://` 后面什么都没有），此时这个 URL 不是产物。
 fn url_host(url: &str) -> Option<String> {
-    let after = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
+    let after = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
     let authority = after.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         return None;
@@ -403,14 +419,7 @@ impl Lineage {
     ///
     /// `bash_cmd` 是 shell 调用的原始命令行（adapter 单独提取的那一份）：
     /// 血缘靠它判断这次调用有没有**写意图**，从而区分"产出者"和"只是提到过"。
-    pub fn on_call(
-        &mut self,
-        key: &str,
-        tool: &str,
-        args: &str,
-        bash_cmd: Option<&str>,
-        ts_wall_ns: u64,
-    ) -> u64 {
+    pub fn on_call(&mut self, key: &str, tool: &str, args: &str, bash_cmd: Option<&str>, ts_wall_ns: u64) -> u64 {
         let artifacts = extract(args);
         let idx = self.steps.len();
         let n = idx as u64 + 1;
@@ -530,7 +539,11 @@ impl Lineage {
                 if producer.n < step.n {
                     // 有生产证据才说 "produced by"；只有"提到"时说 "first mentioned by"。
                     // 这是两种不同强度的断言，屏幕上必须能分开读。
-                    let verb = if p.produced { "produced by" } else { "first mentioned by" };
+                    let verb = if p.produced {
+                        "produced by"
+                    } else {
+                        "first mentioned by"
+                    };
                     back.push(format!(
                         "\u{2514}\u{2500} input {} {} step {} {} {}",
                         clip(&display_one(a), 52),
@@ -585,10 +598,11 @@ impl Lineage {
         for a in &step.artifacts {
             if let Some(prod) = self.producer_of(&a.key()) {
                 for pa in &prod.artifacts {
-                    if let Some(p) = pa.path() {
-                        if looks_like_a_file(p) && !v.contains(&p.to_string()) {
-                            v.push(p.to_string());
-                        }
+                    if let Some(p) = pa.path()
+                        && looks_like_a_file(p)
+                        && !v.contains(&p.to_string())
+                    {
+                        v.push(p.to_string());
                     }
                 }
             }
@@ -698,8 +712,18 @@ impl Claim {
 /// 说"我做了这件事"的动词表。**刻意短**：每一个都要在结果文本里以**词边界**
 /// 出现，且必须紧邻一个产物（前后 48/32 列内）。
 const WRITE_VERBS: &[&str] = &[
-    "wrote", "written", "saved", "saved to", "downloaded", "downloaded to", "created",
-    "generated", "exported", "stored", "writing", "saving",
+    "wrote",
+    "written",
+    "saved",
+    "saved to",
+    "downloaded",
+    "downloaded to",
+    "created",
+    "generated",
+    "exported",
+    "stored",
+    "writing",
+    "saving",
 ];
 const FETCH_VERBS: &[&str] = &["fetched", "downloaded", "retrieved", "pulled", "got", "fetched from"];
 /// 说"我执行了这个文件"的动词表（§14.2 的第三种对账）。
@@ -783,11 +807,7 @@ fn command_has_write_intent(cmd: &str) -> bool {
     if base == "tee" {
         return true;
     }
-    if matches!(base, "curl" | "wget")
-        && toks
-            .iter()
-            .any(|t| matches!(t.as_str(), "-o" | "--output" | "-O"))
-    {
+    if matches!(base, "curl" | "wget") && toks.iter().any(|t| matches!(t.as_str(), "-o" | "--output" | "-O")) {
         return true;
     }
     if base == "dd" && toks.iter().any(|t| t.starts_with("of=")) {
@@ -795,10 +815,8 @@ fn command_has_write_intent(cmd: &str) -> bool {
     }
     // 输出重定向：单独成 token 的 `>`/`>>`/`>|`，或紧贴路径的 `>/tmp/x`。
     // `>&`（fd 复制 / `2>&1`）不是文件写，排除。
-    toks.iter().any(|t| {
-        (t == ">" || t == ">>" || t == ">|")
-            || (t.starts_with('>') && t.len() > 1 && !t.starts_with(">&"))
-    })
+    toks.iter()
+        .any(|t| (t == ">" || t == ">>" || t == ">|") || (t.starts_with('>') && t.len() > 1 && !t.starts_with(">&")))
 }
 
 /// `tool.result` 文本 → 它声称做了什么。
@@ -893,10 +911,10 @@ fn contains_word(hay: &str, needle: &str) -> bool {
 ///
 /// 与 §13 的 `head` 同源但更短 —— 血缘行只有一行的预算，括号里塞不下整句。
 pub fn error_note(text: &str) -> Option<String> {
-    if let Some(n) = crate::fail::exit_code_from_text(text) {
-        if n != 0 {
-            return Some(format!("exit {}", n));
-        }
+    if let Some(n) = crate::fail::exit_code_from_text(text)
+        && n != 0
+    {
+        return Some(format!("exit {}", n));
     }
     if let Some(c) = http_status(text) {
         return Some(format!("HTTP {}", c));
@@ -916,12 +934,11 @@ fn http_status(text: &str) -> Option<u32> {
         while let Some(i) = text[from..].find(k) {
             let at = from + i + k.len();
             let digits: String = text[at..].chars().take_while(|c| c.is_ascii_digit()).collect();
-            if digits.len() == 3 {
-                if let Ok(n) = digits.parse::<u32>() {
-                    if (100..=599).contains(&n) {
-                        return Some(n);
-                    }
-                }
+            if digits.len() == 3
+                && let Ok(n) = digits.parse::<u32>()
+                && (100..=599).contains(&n)
+            {
+                return Some(n);
             }
             from = at.max(from + 1);
         }
@@ -1108,7 +1125,10 @@ fn match_net(host: &str, targets: &[String]) -> (String, bool) {
         return ("no outbound connect observed".to_string(), true);
     }
     if is_ip_literal(host) {
-        if targets.iter().any(|t| t == host || t.starts_with(&format!("{}:", host))) {
+        if targets
+            .iter()
+            .any(|t| t == host || t.starts_with(&format!("{}:", host)))
+        {
             return (format!("connect to {} observed", host), false);
         }
         let saw: Vec<String> = targets.iter().take(2).map(|t| clip(t, 24)).collect();
@@ -1117,7 +1137,10 @@ fn match_net(host: &str, targets: &[String]) -> (String, bool) {
             true,
         );
     }
-    ("outbound connect observed (hostname resolution is not visible to us)".to_string(), false)
+    (
+        "outbound connect observed (hostname resolution is not visible to us)".to_string(),
+        false,
+    )
 }
 
 /// 内核路径与声明的路径是不是同一个东西。
@@ -1205,7 +1228,8 @@ pub fn sniff(path: &str) -> Option<String> {
     let h = head.trim_start();
     let hl = h.to_ascii_lowercase();
 
-    let looks_html = hl.starts_with("<!doctype html") || hl.starts_with("<html") || hl.starts_with("<?xml") && hl.contains("html");
+    let looks_html =
+        hl.starts_with("<!doctype html") || hl.starts_with("<html") || hl.starts_with("<?xml") && hl.contains("html");
     let looks_pdf = buf.starts_with(b"%PDF");
     let looks_png = buf.starts_with(&[0x89, b'P', b'N', b'G']);
     let looks_zip = buf.starts_with(b"PK\x03\x04");
@@ -1296,7 +1320,9 @@ pub fn sniff(path: &str) -> Option<String> {
 }
 
 fn looks_text(buf: &[u8]) -> bool {
-    buf.iter().take(32).all(|b| *b == b'\n' || *b == b'\r' || *b == b'\t' || (0x20..0x7f).contains(b))
+    buf.iter()
+        .take(32)
+        .all(|b| *b == b'\n' || *b == b'\r' || *b == b'\t' || (0x20..0x7f).contains(b))
 }
 
 // ---------------------------------------------------------------
@@ -1321,9 +1347,7 @@ impl KernelFacts {
     pub fn observe(&mut self, ev: &crate::event::Event) {
         match &ev.payload {
             Payload::ProcExec { .. } => self.exec_seen = true,
-            Payload::FileOpen {
-                path, flags, ok, ..
-            } => {
+            Payload::FileOpen { path, flags, ok, .. } => {
                 let write = crate::render::is_write_intent(*flags);
                 // 失败**也**记：`openat /tmp/x.pdf EACCES` 说明这次调用确实碰了这个
                 // 路径；把它丢掉会让"没写"变成一个假结论。成功与否由渲染层决定。
@@ -1345,10 +1369,10 @@ impl KernelFacts {
                 }
             }
             Payload::NetSendto { peer, .. } => {
-                if let Some(p) = peer {
-                    if !self.net_targets.contains(p) {
-                        self.net_targets.push(p.clone());
-                    }
+                if let Some(p) = peer
+                    && !self.net_targets.contains(p)
+                {
+                    self.net_targets.push(p.clone());
                 }
             }
             _ => {}
@@ -1412,11 +1436,7 @@ mod tests {
         // `/dev/null` 这类每条命令都会碰的东西不该进血缘表：它们会把真正的产物
         // 从 4 个名额里挤出去，还会连出假的链。
         let got = extract("ls /tmp > /dev/null 2>/dev/null");
-        assert!(
-            got.iter().all(|a| a.path() != Some("/dev/null")),
-            "{:?}",
-            got
-        );
+        assert!(got.iter().all(|a| a.path() != Some("/dev/null")), "{:?}", got);
     }
 
     #[test]
@@ -1595,7 +1615,11 @@ mod tests {
         let net = vec!["10.1.2.3:443".to_string()];
         let got = evaluate(&c, &facts(&[], &net, false));
         assert!(!got[0].mismatch, "{:?}", got[0]);
-        assert!(got[0].kernel.contains("hostname resolution is not visible"), "{:?}", got[0]);
+        assert!(
+            got[0].kernel.contains("hostname resolution is not visible"),
+            "{:?}",
+            got[0]
+        );
     }
 
     #[test]
@@ -1684,7 +1708,13 @@ mod tests {
     #[test]
     fn a_consumer_links_back_to_the_earlier_producer() {
         let l = lineage_with(&[
-            ("c1", "Bash", "curl -o /tmp/a.pdf https://x/a.pdf", false, Some("exit 22")),
+            (
+                "c1",
+                "Bash",
+                "curl -o /tmp/a.pdf https://x/a.pdf",
+                false,
+                Some("exit 22"),
+            ),
             ("c2", "Bash", "display_pdf /tmp/a.pdf", false, Some("exit 1")),
         ]);
         let chain = l.chain("c2");
@@ -1698,7 +1728,13 @@ mod tests {
     #[test]
     fn a_producer_links_forward_to_the_later_consumer() {
         let l = lineage_with(&[
-            ("c1", "Bash", "curl -o /tmp/a.pdf https://x/a.pdf", false, Some("exit 22")),
+            (
+                "c1",
+                "Bash",
+                "curl -o /tmp/a.pdf https://x/a.pdf",
+                false,
+                Some("exit 22"),
+            ),
             ("c2", "Read", "/tmp/a.pdf", true, None),
         ]);
         let chain = l.chain("c1");
@@ -1716,7 +1752,11 @@ mod tests {
             ("c3", "Bash", cmd, false, Some("exit 28")),
         ]);
         let chain = l.chain("c3");
-        assert!(chain.iter().any(|c| c.contains("produced by step 1 Bash (ok)")), "{:?}", chain);
+        assert!(
+            chain.iter().any(|c| c.contains("produced by step 1 Bash (ok)")),
+            "{:?}",
+            chain
+        );
         // 命令里有一个路径**和一个 URL**，两个都被 3 步提到过。
         assert_eq!(l.stats().reused, 2, "both the path and the URL repeat");
     }
@@ -1731,11 +1771,7 @@ mod tests {
         ]);
         let chain = l.chain("c2");
         assert_eq!(chain.len(), 1, "{:?}", chain);
-        assert!(
-            chain[0].contains("first mentioned by step 1 Bash (ok)"),
-            "{:?}",
-            chain
-        );
+        assert!(chain[0].contains("first mentioned by step 1 Bash (ok)"), "{:?}", chain);
         assert!(!chain[0].contains("produced by"), "消费者被说成了产出者: {:?}", chain);
     }
 
@@ -1767,12 +1803,7 @@ mod tests {
     fn a_failed_result_claim_is_not_production_evidence() {
         let mut l = Lineage::new();
         l.on_call("c1", "Bash", "python3 gen.py", Some("python3 gen.py"), 1);
-        l.on_result(
-            "c1",
-            false,
-            Some("exit 1".into()),
-            "Error writing /tmp/x.pdf",
-        );
+        l.on_result("c1", false, Some("exit 1".into()), "Error writing /tmp/x.pdf");
         l.on_call("c2", "Read", "/tmp/x.pdf", None, 2);
         l.on_result("c2", false, Some("exit 1".into()), "");
         let chain = l.chain("c2");

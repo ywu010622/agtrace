@@ -10,21 +10,11 @@ pub mod text;
 
 use crate::event::{Binding, Event, Kind, Layer, Payload, errno_name};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderOpts {
     pub color: bool,
     pub full: bool,
     pub verbose: bool,
-}
-
-impl Default for RenderOpts {
-    fn default() -> Self {
-        RenderOpts {
-            color: false,
-            full: false,
-            verbose: false,
-        }
-    }
 }
 
 /// 是否 stdout 是 tty —— 非 tty（重定向/管道）时自动关色，避免日志里全是转义码。
@@ -277,14 +267,7 @@ pub fn payload_line(ev: &Event, budget: usize) -> String {
                 if *errno == 0 {
                     format!("openat {}  {}=failed (errno not captured){}", path, f, rel)
                 } else {
-                    format!(
-                        "openat {}  {}=failed {}({}){}",
-                        path,
-                        f,
-                        errno_name(*errno),
-                        errno,
-                        rel
-                    )
+                    format!("openat {}  {}=failed {}({}){}", path, f, errno_name(*errno), errno, rel)
                 }
             }
         }
@@ -410,6 +393,7 @@ pub fn payload_line(ev: &Event, budget: usize) -> String {
 /// `class` 不占列：它是 `head`/`deepest` 措辞的机器可读版本（`exit 2; unbound: ...`
 /// 已经把类别说完了），再花一遍 120 列的预算等于把命令又挤掉一截。
 /// 参数保留是为了让调用点与 json 字段一一对应，读者不必猜哪个字段没被渲染。
+#[allow(clippy::too_many_arguments)]
 fn fail_line(
     step: u64,
     tool: &str,

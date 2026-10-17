@@ -762,11 +762,11 @@ impl KernelLineParser {
 
         // v0.4.2：记录 (pid, fd) → 对端，供后续 sendto 归因。
         // fd 会被复用，这是 most-recent 启发式；UDP 无连接则无记录。
-        if let (Some(pid), Some(fd)) = (f[2].parse::<u32>().ok(), f[6].parse::<i64>().ok()) {
-            if !addr.is_empty() {
-                let port_opt = if family == 2 || family == 10 { Some(port) } else { None };
-                self.fd_peer.insert((pid, fd), (addr.clone(), port_opt));
-            }
+        if let (Some(pid), Some(fd)) = (f[2].parse::<u32>().ok(), f[6].parse::<i64>().ok())
+            && !addr.is_empty()
+        {
+            let port_opt = if family == 2 || family == 10 { Some(port) } else { None };
+            self.fd_peer.insert((pid, fd), (addr.clone(), port_opt));
         }
         // connect 失败 → policy.deny（§2.2 Group D）。
         //
@@ -785,7 +785,7 @@ impl KernelLineParser {
             deny.payload = Payload::PolicyDeny {
                 syscall: "connect".into(),
                 target: if family == 1 {
-                    format!("AF_UNIX")
+                    "AF_UNIX".to_string()
                 } else {
                     format!("{}:{}", addr, port)
                 },
@@ -829,12 +829,11 @@ impl KernelLineParser {
                 peer: {
                     let pid: Option<u32> = f[2].parse().ok();
                     let fd: i64 = f[6].parse().unwrap_or(-1);
-                    pid.and_then(|p| self.fd_peer.get(&(p, fd))).map(|(a, port)| {
-                        match port {
+                    pid.and_then(|p| self.fd_peer.get(&(p, fd)))
+                        .map(|(a, port)| match port {
                             Some(pt) => format!("{}:{}", a, pt),
                             None => a.clone(),
-                        }
-                    })
+                        })
                 },
             },
             trunc: Vec::new(),
@@ -951,8 +950,6 @@ pub fn family_name(f: u16) -> &'static str {
     }
 }
 
-/// 供渲染层复用的辅助：把 argv 渲染成 `["a","b"]` 形式（单行、可读）。
-
 /// 一个简单的 FIFO 行缓冲，负责把 `read()` 出来的任意字节块切成完整的行。
 ///
 /// **必须容忍最后一行不完整**（§2.4 优雅退出）：半行留在缓冲区里等下次，
@@ -1042,7 +1039,10 @@ mod sensitive_read_tests {
     #[test]
     fn default_drops_benign_readonly_open() {
         let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
-        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|-100|3|/usr/lib/locale/en_US/LC_MESSAGES");
+        let evs = feed(
+            &mut p,
+            "OPEN|1000|1234|1234|1|5|0|-100|3|/usr/lib/locale/en_US/LC_MESSAGES",
+        );
         assert!(evs.is_empty());
         assert_eq!(p.stats.files_dropped_default, 1);
     }
@@ -1058,7 +1058,10 @@ mod sensitive_read_tests {
     fn file_all_keeps_everything() {
         let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
         p.set_file_all(true);
-        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|-100|3|/usr/lib/locale/en_US/LC_MESSAGES");
+        let evs = feed(
+            &mut p,
+            "OPEN|1000|1234|1234|1|5|0|-100|3|/usr/lib/locale/en_US/LC_MESSAGES",
+        );
         assert!(evs.iter().any(|e| e.kind == Kind::InfraFileOpen));
         assert_eq!(p.stats.files_dropped_default, 0);
     }
@@ -1141,7 +1144,10 @@ mod protocol_edge_tests {
             &vec!["curl".to_string(), "-o".into(), "/tmp/x.pdf".into()],
             "pid 4243's argv was polluted by 4242's late ARGV rows"
         );
-        assert_eq!(p.stats.argv_orphans, 3, "late rows must be counted, not silently dropped");
+        assert_eq!(
+            p.stats.argv_orphans, 3,
+            "late rows must be counted, not silently dropped"
+        );
     }
 
     /// 同一条 exec 的 ARGV 行必须仍然正常归组（pid/tid 校验不能把正常路径弄坏）。
@@ -1156,7 +1162,11 @@ mod protocol_edge_tests {
         feed(&mut p, "TICK|2000", &mut out);
         let ev = only_exec(&out, 4242);
         assert_eq!(exec_argv(ev), &vec!["curl".to_string(), "-s".into()]);
-        assert!(ev.trunc.is_empty(), "complete argv must not be reported as truncated: {:?}", ev.trunc);
+        assert!(
+            ev.trunc.is_empty(),
+            "complete argv must not be reported as truncated: {:?}",
+            ev.trunc
+        );
         assert_eq!(p.stats.argv_orphans, 0);
     }
 
@@ -1173,7 +1183,11 @@ mod protocol_edge_tests {
         feed(&mut p, "TICK|2000", &mut out);
         let ev = only_exec(&out, 4242);
         assert_eq!(exec_argv(ev), &vec!["cd".to_string(), "..".to_string()]);
-        assert!(ev.trunc.is_empty(), "legit `..` must not be reported as truncation: {:?}", ev.trunc);
+        assert!(
+            ev.trunc.is_empty(),
+            "legit `..` must not be reported as truncation: {:?}",
+            ev.trunc
+        );
     }
 
     /// 真正的截断（值达到上限且以 `..` 收尾）仍然要记录，且尾部标记必须摘掉。
@@ -1204,9 +1218,17 @@ mod protocol_edge_tests {
         let mut out = Vec::new();
         // flags=1 -> write intent (kept by the default filter); dirfd=-100 = AT_FDCWD
         feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|out.txt", &mut out);
-        let ev = out.iter().find(|e| e.kind == Kind::InfraFileOpen).expect("open dropped");
+        let ev = out
+            .iter()
+            .find(|e| e.kind == Kind::InfraFileOpen)
+            .expect("open dropped");
         match &ev.payload {
-            crate::event::Payload::FileOpen { path, path_is_relative, dirfd, .. } => {
+            crate::event::Payload::FileOpen {
+                path,
+                path_is_relative,
+                dirfd,
+                ..
+            } => {
                 assert_eq!(path, "out.txt");
                 assert_eq!(*dirfd, -100);
                 assert!(*path_is_relative, "a cwd-relative path is still relative");
@@ -1220,7 +1242,10 @@ mod protocol_edge_tests {
         let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
         let mut out = Vec::new();
         feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|/tmp/out.txt", &mut out);
-        let ev = out.iter().find(|e| e.kind == Kind::InfraFileOpen).expect("open dropped");
+        let ev = out
+            .iter()
+            .find(|e| e.kind == Kind::InfraFileOpen)
+            .expect("open dropped");
         match &ev.payload {
             crate::event::Payload::FileOpen { path_is_relative, .. } => assert!(!*path_is_relative),
             other => panic!("unexpected: {:?}", other),

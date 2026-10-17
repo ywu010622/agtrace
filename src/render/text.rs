@@ -106,12 +106,12 @@ impl TextRenderer {
 
     /// 渲染一批事件。返回应当写出的文本（含换行）。
     pub fn render_batch(&mut self, events: &[Event]) -> String {
-        if !self.origin_locked {
-            if let Some(o) = time_origin(events) {
-                self.origin = Some(o);
-                // 只有拿到过事件之后才锁定；之后即使出现更早的 (late) 事件也不回退。
-                self.origin_locked = true;
-            }
+        if !self.origin_locked
+            && let Some(o) = time_origin(events)
+        {
+            self.origin = Some(o);
+            // 只有拿到过事件之后才锁定；之后即使出现更早的 (late) 事件也不回退。
+            self.origin_locked = true;
         }
         let mut out = String::new();
         for ev in events {
@@ -293,18 +293,18 @@ impl TextRenderer {
         ));
         // 绝对时间跨度：相对时间戳没有"这是几点"的信息，而排查时经常要拿这个
         // 去跟别的日志对表。两端都给 ISO8601（与 transcript 原生格式一致）。
-        if let (Some(a), Some(b)) = (ev.first_wall, ev.last_wall) {
-            if b > a {
-                s.push_str(&format!(
-                    "{}\n",
-                    c(&format!(
-                        "--- span {} -> {} ({:.6}s)",
-                        crate::adapter::iso8601_ms(a),
-                        crate::adapter::iso8601_ms(b),
-                        (b - a) as f64 / 1e9
-                    ))
-                ));
-            }
+        if let (Some(a), Some(b)) = (ev.first_wall, ev.last_wall)
+            && b > a
+        {
+            s.push_str(&format!(
+                "{}\n",
+                c(&format!(
+                    "--- span {} -> {} ({:.6}s)",
+                    crate::adapter::iso8601_ms(a),
+                    crate::adapter::iso8601_ms(b),
+                    (b - a) as f64 / 1e9
+                ))
+            ));
         }
         s.push_str(&self.failures_section(ev));
         let mut flags = Vec::new();
@@ -408,7 +408,10 @@ impl TextRenderer {
             // 这一层一旦"顺手润色"，屏幕上就会出现比账里更硬的话。
             for l in &f.lineage {
                 let line = crate::event::one_line(l);
-                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, line))));
+                s.push_str(&format!(
+                    "{}\n",
+                    colorize(&self.opts, DIM, &format!("{}{}", INDENT, line))
+                ));
             }
             // v0.6 §14.2：其余几列对账。`!!` 的那一行已经在 `f.head` 里了，
             // 这里补的是同一次结果里的**其它** claim（一行结果可以既说写了文件
@@ -422,14 +425,21 @@ impl TextRenderer {
                 }
                 s.push_str(&format!(
                     "{}\n",
-                    colorize(&self.opts, if c.mismatch { RED } else { DIM }, &format!("{}{}", INDENT, line))
+                    colorize(
+                        &self.opts,
+                        if c.mismatch { RED } else { DIM },
+                        &format!("{}{}", INDENT, line)
+                    )
                 ));
             }
             // v0.6 §14.3：内容嗅探。**用户态启发式** —— 句子自己带着这句话
             //（由 `lineage::sniff` 保证），这里只负责缩进。
             for x in &f.sniff {
                 let line = crate::event::one_line(x);
-                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, line))));
+                s.push_str(&format!(
+                    "{}\n",
+                    colorize(&self.opts, DIM, &format!("{}{}", INDENT, line))
+                ));
             }
         }
         if !ev.kernel_available {
@@ -1058,13 +1068,7 @@ mod tests {
         let visible = strip_ansi(&colored);
         assert_eq!(visible, plain, "着色不得改变可见文本（截断位置必须一致）");
         for (a, b) in visible.lines().zip(plain.lines()) {
-            assert_eq!(
-                display_width(a),
-                display_width(b),
-                "可见列宽不一致: {:?} vs {:?}",
-                a,
-                b
-            );
+            assert_eq!(display_width(a), display_width(b), "可见列宽不一致: {:?} vs {:?}", a, b);
         }
         assert!(
             plain.lines().any(|l| display_width(l) > 110),

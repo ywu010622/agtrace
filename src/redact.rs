@@ -363,20 +363,14 @@ fn redact_auth_scheme(s: &str) -> Option<String> {
 /// appears in a command (`curl -d '{"password":"hunter2"}'`). Only the quoted
 /// value is replaced; the JSON structure and the rest of the command survive.
 fn redact_json_kv(s: &str) -> Option<String> {
-    let quotes: Vec<usize> = s
-        .char_indices()
-        .filter(|(_, c)| *c == '"')
-        .map(|(i, _)| i)
-        .collect();
+    let quotes: Vec<usize> = s.char_indices().filter(|(_, c)| *c == '"').map(|(i, _)| i).collect();
     let mut qi = 0;
     while qi + 1 < quotes.len() {
         let k_open = quotes[qi];
         let k_close = quotes[qi + 1];
         let key = s[k_open + 1..k_close].to_ascii_lowercase();
         let mut j = skip_hspace(s, k_close + 1);
-        let is_pair = j < s.len()
-            && s[j..].starts_with(':')
-            && SENSITIVE_JSON_KEYS.contains(&key.as_str());
+        let is_pair = j < s.len() && s[j..].starts_with(':') && SENSITIVE_JSON_KEYS.contains(&key.as_str());
         if !is_pair {
             qi += 1;
             continue;
@@ -435,9 +429,7 @@ fn redact_kv(s: &str) -> Option<String> {
         if key_start == eq {
             continue;
         }
-        let key = s[key_start..eq]
-            .trim_start_matches('-')
-            .to_ascii_lowercase();
+        let key = s[key_start..eq].trim_start_matches('-').to_ascii_lowercase();
         if !SENSITIVE_KEYS.contains(&key.as_str()) {
             continue;
         }

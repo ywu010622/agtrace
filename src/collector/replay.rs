@@ -39,8 +39,7 @@ pub struct KernelReplay {
 
 impl KernelReplay {
     pub fn open(path: &str, file_all: bool, redact: RedactMode) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("--kernel-lines {}: {}", path, e))?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("--kernel-lines {}: {}", path, e))?;
         let lines: Vec<String> = text
             .lines()
             .map(|l| l.trim_end_matches('\r').to_string())
@@ -194,11 +193,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_reported_with_the_path() {
-        let e = match KernelReplay::open(
-            "/tmp/agtrace_nope_12345/kernel.txt",
-            false,
-            RedactMode::Off,
-        ) {
+        let e = match KernelReplay::open("/tmp/agtrace_nope_12345/kernel.txt", false, RedactMode::Off) {
             Ok(_) => panic!("a missing capture file must be reported"),
             Err(e) => e,
         };

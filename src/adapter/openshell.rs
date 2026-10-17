@@ -72,12 +72,7 @@ pub struct OpenShellAdapter {
 }
 
 impl OpenShellAdapter {
-    pub fn new(
-        path: &str,
-        base: TimeBase,
-        tool_preview_max: usize,
-        redact: RedactMode,
-    ) -> Result<Self, AdapterError> {
+    pub fn new(path: &str, base: TimeBase, tool_preview_max: usize, redact: RedactMode) -> Result<Self, AdapterError> {
         let p = Path::new(path);
         if !p.is_file() {
             return Err(AdapterError::NotFound(format!(
@@ -145,7 +140,7 @@ impl OpenShellAdapter {
         Ok(())
     }
 
-    fn to_events(&mut self, out: &mut Vec<Event>) {
+    fn emit_events(&mut self, out: &mut Vec<Event>) {
         let raw = std::mem::take(&mut self.raw);
         for (t, v) in raw {
             let wall_ns = self.origin_ns + (t.max(0.0) * 1e9) as u64;
@@ -315,7 +310,7 @@ impl EventAdapter for OpenShellAdapter {
     fn poll(&mut self, out: &mut Vec<Event>) -> Result<PollOutcome, AdapterError> {
         if !self.parsed {
             self.parse_all()?;
-            self.to_events(out);
+            self.emit_events(out);
             return Ok(PollOutcome::Progress);
         }
         if !self.done {
@@ -385,16 +380,11 @@ mod tests {
                 SECRET
             ),
         ];
-        let dir = std::env::temp_dir().join(format!(
-            "agtrace_openshell_redact_{}_{}",
-            std::process::id(),
-            uniq
-        ));
+        let dir = std::env::temp_dir().join(format!("agtrace_openshell_redact_{}_{}", std::process::id(), uniq));
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("fixture.jsonl");
         std::fs::write(&p, lines.join("\n") + "\n").unwrap();
-        let mut a =
-            OpenShellAdapter::new(p.to_str().unwrap(), TimeBase::Epoch, 512, mode).unwrap();
+        let mut a = OpenShellAdapter::new(p.to_str().unwrap(), TimeBase::Epoch, 512, mode).unwrap();
         let mut out = Vec::new();
         a.poll(&mut out).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -457,11 +447,7 @@ mod tests {
         let evs = run(RedactMode::ArgvContent);
         assert!(!call_preview(&evs).contains(SECRET), "{}", call_preview(&evs));
         assert!(!model_detail(&evs).contains(SECRET), "{}", model_detail(&evs));
-        assert!(
-            !result_preview(&evs).contains(SECRET),
-            "{}",
-            result_preview(&evs)
-        );
+        assert!(!result_preview(&evs).contains(SECRET), "{}", result_preview(&evs));
     }
 
     /// `--redact off` 必须真的不打码。
