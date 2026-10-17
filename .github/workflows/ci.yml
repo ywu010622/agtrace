@@ -50,6 +50,10 @@ jobs:
           components: rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all --check
+      - name: Check the Python helpers compile
+        # scripts/dsh-logfmt.py is a user-facing tool (syslog-style session
+        # reader); a syntax error there should fail CI, not the user's shell.
+        run: python3 -m py_compile scripts/dsh-logfmt.py examples/langchain_callback.py
 
   # ---------------------------------------------------------------------------
   # Lints. The lint gate does not need the embedded eBPF object: building it

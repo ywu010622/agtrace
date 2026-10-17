@@ -166,6 +166,37 @@ discovers `.agents/skills/` and `.dsh/skills/` in the project root, hot-reloaded
 copy it into a workspace, or `~/.dsh/skills/agtrace/SKILL.md` to make it available
 everywhere, and the model can call it via the `skill` tool (humans: `/agtrace`).
 
+### Reading a session log like syslog
+
+The raw session file is JSONL inside independent zstd frames — technically one
+object per line, but a single `assistant/message` record is a page of nested
+JSON, so `jq`/`grep`/`tail -f` are painful. The bundled formatter flattens every
+record to **exactly one line** (newlines inside messages become literal `\n`),
+prints content in full, and can follow a live session:
+
+```bash
+python3 scripts/dsh-logfmt.py auto                # newest session on this machine
+python3 scripts/dsh-logfmt.py -f auto             # follow it live (syslog tail -f)
+python3 scripts/dsh-logfmt.py --all -n 200 auto   # include harness-internal records
+python3 scripts/dsh-logfmt.py --only tool/call,tool/result -f auto
+python3 scripts/dsh-logfmt.py -m 160 auto         # cap each line at 160 characters
+```
+
+```text
+2026-10-17T20:14:54.774Z #8    user/message      https://github.com/...\n审查我的项目...
+2026-10-17T20:14:56.616Z #19   assistant/message turn 1/step 1 model=deepseek-flash [thinking] Let me start...
+2026-10-17T20:14:56.616Z #20   tool/call          pwsh call_00_x $ Get-Location; Get-ChildItem ...
+2026-10-17T20:14:57.229Z #22   job/settled        call_00_x completed exit code: 0
+2026-10-17T20:14:57.230Z #23   tool/result        call_00_x OK \r\n---\nPath ---- C:\Users\...
+```
+
+Defaults: harness bookkeeping (`step/*`, `request/*`, `job/registered`, ...) and
+harness-injected context messages (runtime/skill/time context) are hidden —
+`--all` shows everything; `--raw` prints the flattened raw JSON for byte-level
+diffing. Only Python 3 + the `zstd` CLI are required (both already present after
+building agtrace; `apt install zstd` otherwise). From WSL it also finds the
+Windows app's sessions under `/mnt/<drive>/Users/<user>/.dsh/sessions`.
+
 Platform note: the transcript half is portable and works from WSL against the
 Windows app's session logs. Kernel evidence (`-p`) is Linux-only — WSL cannot
 observe Windows processes' syscalls — and WSL2's 5.15 kernel additionally
