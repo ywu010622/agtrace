@@ -391,7 +391,7 @@ impl KernelLineParser {
         // ARGV|<nsecs>|<pid>|<tid>|<idx>|<value>
         let mut it = line.splitn(6, '|');
         let _ = it.next();
-        let (_ts, _pid, _tid, idx) = match (it.next(), it.next(), it.next(), it.next()) {
+        let (_ts, pid, tid, idx) = match (it.next(), it.next(), it.next(), it.next()) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => {
                 self.stats.lines_malformed += 1;
@@ -406,9 +406,30 @@ impl KernelLineParser {
                 return;
             }
         };
-        match &mut self.pending {
-            Some(p) => p.got.push((idx, value.to_string())),
-            None => self.stats.argv_orphans += 1,
+        let (pid, tid): (u32, u32) = match (pid.parse(), tid.parse()) {
+            (Ok(p), Ok(t)) => (p, t),
+            _ => {
+                self.stats.lines_malformed += 1;
+                return;
+            }
+        };
+        // The ARGV rows belong to the EXEC/FAIL that immediately precedes them **on
+        // the same thread**. Matching by arrival order alone is not enough: bpftrace's
+        // userspace reader interleaves per-CPU perf buffers, so another CPU's
+        // EXEC/TICK/FORK can land between an exec and its ARGV rows. Without this
+        // check those rows were silently attached to the *next* pending exec (wrong
+        // argv -> wrong argv binding) and the real one got a false "ARGV lines
+        // incomplete" truncation. A mismatched row is an orphan: counted, never used.
+        let matches_pending = match &self.pending {
+            Some(p) => p.ev.pid == Some(pid) && p.ev.tid == Some(tid),
+            None => false,
+        };
+        if !matches_pending {
+            self.stats.argv_orphans += 1;
+            return;
+        }
+        if let Some(p) = &mut self.pending {
+            p.got.push((idx, value.to_string()));
         }
     }
 
@@ -618,7 +639,14 @@ impl KernelLineParser {
         let mut trunc = Vec::new();
         let path = clean_str(f[9], self.str_limit, "path", &mut trunc);
         // §5.2 #2：相对路径无法还原成绝对路径 —— 只标记，**不猜**。
-        let path_is_relative = !path.starts_with('/') && dirfd != libc::AT_FDCWD as i64;
+        //
+        // "relative" is a property of the path alone: no leading '/' means the kernel
+        // resolved it against `dirfd` (AT_FDCWD = cwd, anything else = another dir),
+        // and the timeline cannot turn either into an absolute path. The old test also
+        // required `dirfd != AT_FDCWD`, so the *common* case — plain relative opens
+        // like `> out.txt`, resolved against the cwd — was rendered without the
+        // `(rel …)` marker even though its base directory is just as unknown.
+        let path_is_relative = !path.starts_with('/');
 
         // v0.4.2：默认模式下，只读 open 只有敏感路径才保留（写意图的一律保留）。
         // 内核侧默认已放行全部 open（--file-all 的语义不变：全部保留），过滤在这里做。
@@ -847,7 +875,7 @@ fn summarize_argv(got: &[(usize, String)], slots: usize, limit: usize, trunc: &m
                 break;
             }
             Some(v) => {
-                if v.ends_with(TRUNC_MARK) {
+                if is_kernel_truncated(v, limit) {
                     trunc.push(
                         TruncNote::new(format!("argv[{}]", argv.len()), None, limit)
                             .with_note("single argument exceeds MAX_STRLEN, tail marked with `..`"),
@@ -872,9 +900,19 @@ fn summarize_argv(got: &[(usize, String)], slots: usize, limit: usize, trunc: &m
     argv
 }
 
+/// `..` 是否真的是内核侧截断留下的标记。
+///
+/// 只看后缀不够：`cd ..`、`ls ..`、`/a/b/..` 里的 `..` 是**真实内容**。曾经无条件
+/// 把它当截断标记，于是 `cd ..` 的 argv[1] 被改成 `""` 并附上一条假截断说明
+/// （§4.3：不静默，也**不要伪造**）。截断值由生产者补成 ".."，其总长度必然达到
+/// 配置上限（64 字节上限 → 63 字节内容 + ".."）；短于上限的 ".." 是内容。
+fn is_kernel_truncated(s: &str, limit: usize) -> bool {
+    s.ends_with(TRUNC_MARK) && s.len() >= limit
+}
+
 /// 若字符串以 bpftrace 的截断标记 `..` 结尾，产出一条 `TruncNote`。
 fn check_str_trunc(s: &str, limit: usize) -> Option<TruncNote> {
-    if s.ends_with(TRUNC_MARK) {
+    if is_kernel_truncated(s, limit) {
         Some(TruncNote::new("path", None, limit).with_note(format!(
             "truncated at the kernel-side str() cap of {} bytes (original length unknown), tail marked with `..`",
             limit
@@ -890,7 +928,7 @@ fn check_str_trunc(s: &str, limit: usize) -> Option<TruncNote> {
 /// 控制字符"是两件无关的事，一个超长路径照样可以把 `\r` / `\x1b` 带进来。
 /// 原来这里直接 `to_string()`，于是 `..` 成了绕过转义的唯一姿势。
 fn clean_str(s: &str, limit: usize, field: &str, trunc: &mut Vec<TruncNote>) -> String {
-    if s.ends_with(TRUNC_MARK) {
+    if is_kernel_truncated(s, limit) {
         trunc.push(TruncNote::new(field, None, limit).with_note(format!(
             "truncated at the kernel-side str() cap of {} bytes (original length unknown)",
             limit
@@ -1027,11 +1065,15 @@ mod sensitive_read_tests {
 
     /// 被内核截断的路径（以 `..` 收尾）照样要过 `one_line`：截断与"里面有没有
     /// 控制字符"无关，而 `..` 曾经是绕过转义的唯一姿势（§3.2 只允许单行 payload）。
+    ///
+    /// 路径必须长到 `str_limit` 以上才算截断（短于上限的 `..` 是真实内容，见
+    /// `is_kernel_truncated`），所以这里用 64 字节上限 + 超长路径来构造真实形状。
     #[test]
     fn truncated_path_is_still_control_escaped() {
-        let mut p = KernelLineParser::with_redact(4096, crate::redact::RedactMode::Argv);
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Argv);
         // flags=1（写意图），否则这条只读 open 会被默认过滤掉。
-        let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|/tmp/ev\x1b[31m..");
+        let long = format!("/tmp/ev\x1b[31m{}\x1b[31m..", "a".repeat(64));
+        let evs = feed(&mut p, &format!("OPEN|1000|1234|1234|1|5|1|-100|3|{}", long));
         let ev = evs.iter().find(|e| e.kind == Kind::InfraFileOpen).unwrap();
         match &ev.payload {
             crate::event::Payload::FileOpen { path, .. } => {
@@ -1050,6 +1092,152 @@ mod sensitive_read_tests {
         // relative path: cannot resolve, do not guess (§5.2 #2)
         let evs = feed(&mut p, "OPEN|1000|1234|1234|1|5|0|42|3|shadow");
         assert!(evs.is_empty());
+    }
+}
+
+/// ARGV 归组 / 截断判定 / 相对路径标记 —— 都是"输入侧证据是否可信"的边缘规则。
+#[cfg(test)]
+mod protocol_edge_tests {
+    use super::*;
+    use crate::event::Kind;
+
+    fn feed(p: &mut KernelLineParser, line: &str, out: &mut Vec<Event>) {
+        p.feed_line(line, out);
+    }
+
+    fn only_exec(out: &[Event], pid: u32) -> &Event {
+        out.iter()
+            .find(|e| e.kind == Kind::RuntimeProcExec && e.pid == Some(pid))
+            .unwrap_or_else(|| panic!("no exec event for pid {}", pid))
+    }
+
+    fn exec_argv(ev: &Event) -> &[String] {
+        match &ev.payload {
+            crate::event::Payload::ProcExec { argv, .. } => argv,
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// bpftrace 的读端会交错 per-CPU buffer，另一颗 CPU 的 EXEC/TICK 可能插在
+    /// 一条 exec 和它的 ARGV 行之间。按到达顺序归组会把 argv 贴到**下一条** exec
+    /// 上（错误绑定）；现在 pid/tid 不匹配的 ARGV 行必须被计成 orphan、绝不使用。
+    #[test]
+    fn argv_rows_from_another_process_are_orphaned_not_attached_to_the_next_exec() {
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut out = Vec::new();
+        // CPU A: EXEC | CPU B: 完整的 EXEC+ARGV 组 | CPU A 的 ARGV 行迟到
+        feed(&mut p, "EXEC|1000|4242|4242|1|0|3|bash|/usr/bin/bash", &mut out);
+        feed(&mut p, "EXEC|1001|4243|4243|1|0|3|bash|/usr/bin/bash", &mut out);
+        feed(&mut p, "ARGV|1001|4243|4243|0|curl", &mut out);
+        feed(&mut p, "ARGV|1001|4243|4243|1|-o", &mut out);
+        feed(&mut p, "ARGV|1001|4243|4243|2|/tmp/x.pdf", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|0|echo", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|1|hi", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|2|", &mut out);
+        feed(&mut p, "TICK|2000", &mut out);
+
+        assert_eq!(
+            exec_argv(only_exec(&out, 4243)),
+            &vec!["curl".to_string(), "-o".into(), "/tmp/x.pdf".into()],
+            "pid 4243's argv was polluted by 4242's late ARGV rows"
+        );
+        assert_eq!(p.stats.argv_orphans, 3, "late rows must be counted, not silently dropped");
+    }
+
+    /// 同一条 exec 的 ARGV 行必须仍然正常归组（pid/tid 校验不能把正常路径弄坏）。
+    #[test]
+    fn argv_rows_from_the_same_process_still_group_normally() {
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut out = Vec::new();
+        feed(&mut p, "EXEC|1000|4242|4242|1|0|3|bash|/usr/bin/bash", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|0|curl", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|1|-s", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|2|", &mut out);
+        feed(&mut p, "TICK|2000", &mut out);
+        let ev = only_exec(&out, 4242);
+        assert_eq!(exec_argv(ev), &vec!["curl".to_string(), "-s".into()]);
+        assert!(ev.trunc.is_empty(), "complete argv must not be reported as truncated: {:?}", ev.trunc);
+        assert_eq!(p.stats.argv_orphans, 0);
+    }
+
+    /// `cd ..` / `ls ..` 的 `..` 是**真实参数**，不是内核截断标记。曾经被无条件
+    /// 摘掉并报"截断"，argv 变成 `["cd", ""]` —— 既是数据损坏也是假声明。
+    #[test]
+    fn a_real_argument_that_is_dotdot_is_not_a_truncation_marker() {
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut out = Vec::new();
+        feed(&mut p, "EXEC|1000|4242|4242|1|0|3|bash|/usr/bin/bash", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|0|cd", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|1|..", &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|2|", &mut out);
+        feed(&mut p, "TICK|2000", &mut out);
+        let ev = only_exec(&out, 4242);
+        assert_eq!(exec_argv(ev), &vec!["cd".to_string(), "..".to_string()]);
+        assert!(ev.trunc.is_empty(), "legit `..` must not be reported as truncation: {:?}", ev.trunc);
+    }
+
+    /// 真正的截断（值达到上限且以 `..` 收尾）仍然要记录，且尾部标记必须摘掉。
+    #[test]
+    fn a_value_at_the_cap_ending_in_dotdot_is_still_recorded_as_truncated() {
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut out = Vec::new();
+        let long = format!("{}..", "a".repeat(64)); // producer shape: >= cap, tail marked
+        feed(&mut p, "EXEC|1000|4242|4242|1|0|2|bash|/usr/bin/bash", &mut out);
+        feed(&mut p, &format!("ARGV|1000|4242|4242|0|{}", long), &mut out);
+        feed(&mut p, "ARGV|1000|4242|4242|1|", &mut out);
+        feed(&mut p, "TICK|2000", &mut out);
+        let ev = only_exec(&out, 4242);
+        assert_eq!(exec_argv(ev), &vec!["a".repeat(64)]);
+        assert!(
+            ev.trunc.iter().any(|t| t.field == "argv[0]"),
+            "real truncation must still be recorded: {:?}",
+            ev.trunc
+        );
+    }
+
+    /// 相对路径的"相对"只由路径自身决定：没有前导 `/` 就是相对 `dirfd` 解析的。
+    /// 旧代码额外要求 `dirfd != AT_FDCWD`，于是最常见的 `> out.txt`（cwd 相对）
+    /// 反而不带 `(rel …)` 标记，看起来像一条已解析的路径。
+    #[test]
+    fn relative_open_is_marked_relative_even_against_the_cwd() {
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut out = Vec::new();
+        // flags=1 -> write intent (kept by the default filter); dirfd=-100 = AT_FDCWD
+        feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|out.txt", &mut out);
+        let ev = out.iter().find(|e| e.kind == Kind::InfraFileOpen).expect("open dropped");
+        match &ev.payload {
+            crate::event::Payload::FileOpen { path, path_is_relative, dirfd, .. } => {
+                assert_eq!(path, "out.txt");
+                assert_eq!(*dirfd, -100);
+                assert!(*path_is_relative, "a cwd-relative path is still relative");
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn absolute_open_is_not_marked_relative() {
+        let mut p = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut out = Vec::new();
+        feed(&mut p, "OPEN|1000|1234|1234|1|5|1|-100|3|/tmp/out.txt", &mut out);
+        let ev = out.iter().find(|e| e.kind == Kind::InfraFileOpen).expect("open dropped");
+        match &ev.payload {
+            crate::event::Payload::FileOpen { path_is_relative, .. } => assert!(!*path_is_relative),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// `LineBuffer` 按**字节**累积，只在完整行上解码：一次 `read()` 切在多字节
+    /// 字符中间不能产生 U+FFFD，也不能 panic。
+    #[test]
+    fn line_buffer_keeps_a_multibyte_char_split_across_reads() {
+        let data = "检索\n".as_bytes(); // 检 = 3 bytes, 索 = 3 bytes, then the newline
+        let mut b = crate::collector::LineBuffer::new();
+        assert!(b.push(&data[..2]).is_empty(), "a half line must not be emitted");
+        assert!(b.push(&data[2..5]).is_empty());
+        // 最后一段补完第二个字符并给出换行。
+        assert_eq!(b.push(&data[5..]), vec!["检索".to_string()]);
+        assert_eq!(b.pending_bytes(), 0);
     }
 }
 

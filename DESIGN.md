@@ -1729,3 +1729,131 @@ stays an agent debugger rather than becoming a generic distributed tracer.
 | OTel Span <-> System events | no generic integration; OTel export of derived chains planned (14.4) |
 | Cross-service / multi-host | not planned |
 | File content / HTTP semantics | paths and fds only; magic-sniff heuristic for gross mismatches |
+
+## 15. DeepSeek Harness adapter (v0.7)
+
+The fourth adapter, and the first whose source format is a *container* rather
+than a plain transcript file. It exists because the same question the tool asks
+of Claude Code applies to any agent harness: what did the model claim, and what
+does the evidence say? DSH's session log is the agent half of that join.
+
+### 15.1 The container, measured (not assumed)
+
+A DSH session log is `session.v4.jsonl.zstd` under
+`$DSH_HOME/sessions/<projectKey(cwd)>/<id>/`. It is a **plain concatenation of
+independent checksummed Zstandard frames**: frame 0 holds only the header line,
+and every later frame is one durable append batch (DSH batches at ~200 ms; a
+batch holds 1–8 complete JSONL records). Lines are never split across frames.
+Committed bytes are never rewritten; a crash can leave a *torn final frame* that
+the writer repairs on its next open, and a failed append can roll the file back
+— so the file size is not monotonic and **must not be used as a record
+boundary**.
+
+Two consequences drive the implementation:
+
+1. **`zstdDecompressSync(whole file)` is wrong.** It decodes frame 0 and ignores
+   the rest (measured: a 1.38 MB log yields the single header line). The tailer
+   must find frame boundaries structurally.
+2. **Frame boundaries are structural, not magic-number hunts.** `src/adapter/dsh.rs`
+   ports DSH's own `scanZstdFrames`: frame header → block headers (3 bytes) →
+   block payloads → optional checksum, returning complete frame ranges plus a
+   `torn_start`. A frame is decoded only when its structure is complete; the
+   torn tail stays buffered until the rest arrives. This is the same admission
+   policy DSH applies when it reads its own log, which is what makes "the tracer
+   sees what the harness committed" checkable.
+
+The tailer keeps `{file, dev+ino, offset-to-last-complete-frame, pending bytes,
+partial-line buffer}`. It handles: file not yet materialized (wait), file
+shrinking (torn-tail repair: keep already-reported events, drop undecoded tail
+bytes, re-seek), file replaced (reset and count it), and offline drain (no `-f`).
+
+### 15.2 Record mapping (what is observed vs derived)
+
+| DSH record | agtrace kind | notes |
+|---|---|---|
+| `session` (header) | — | session id, cwd, `createdAt` only |
+| `user/message` (source.kind=user) | `agent.prompt` | harness-internal user/message not mapped |
+| `assistant/message` | `agent.model.request` (derived once per `(turn, step)`), `agent.model.thinking` (reasoning blocks), `agent.model.text` | tool-call blocks are **not** re-emitted: the separate `tool/call` record carries them |
+| `tool/call` | `agent.tool.call` | `arguments` is a JSON *string*; shell tools (`pwsh`/`bash`/…) contribute `command` as `bash_cmd` so argv binding works |
+| `tool/result` | `agent.tool.result` | joined by `toolCallId`; tool-level `isError` + `data.error{name,code}` are surfaced in notes |
+| everything else | — | counted as harness-internal under `-v`; truly unknown types counted separately (forward compatibility) |
+
+**Exit codes are a separate record.** DSH deliberately does not put a shell
+command's exit status into `tool/result`: a failing `git` is still
+`isError:false`. The exit code lives in `job/settled.detail` (`exit code: N`,
+status `completed`/`killed`), joined through `data.toolCall.callId`. The adapter
+therefore treats `job/settled` as the **authoritative** failure signal and the
+trailing `[exit code: N]` in the result text as a fallback mirror. When the two
+disagree with `isError`, the tool.result event is classified `Failure` and the
+disagreement is written into the event's `notes` — the exit status is the
+ground truth this tool exists to compare the transcript against, and saying
+"Success" because the tool wrapper was polite would be exactly the dishonesty
+§5 forbids.
+
+Derived, with the caveat attached (same rule as §3.3): `agent.model.request` has
+no record of its own; its timestamp is when the assistant message was recorded,
+not when the request was sent. No token usage is emitted — DSH's log does not
+record it.
+
+### 15.3 Discovery (works for the harness, from WSL, and from inside)
+
+`-S` accepts a log path, a session directory, a session id (or unique prefix), a
+workspace directory, `auto`, or `latest`. `auto` resolves in this order:
+
+1. `$DSH_SESSION_ID` + the sessions root — DSH exports this to every tool shell,
+   so an agent-launched agtrace finds **its own** live session, not "the newest".
+2. newest session of the current workspace (`projectKey(current_dir)` variants,
+   including the WSL `/mnt/c/...` ↔ `C:\...` translation);
+3. newest session under the root.
+
+The sessions root is `$DSH_SESSIONS_ROOT` → `$DSH_HOME/sessions` →
+`~/.dsh/sessions` → (on WSL) `<drive>:\Users\<user>\.dsh\sessions`.
+`projectKey()`, session-id `encodeSegment()` and generation-file selection
+(`session.vN.jsonl[.zstd]`) are ported from DSH's persistence backend: guessing
+the directory naming would make auto-discovery fail in exactly the cases that
+matter.
+
+### 15.4 Integration with the harness
+
+The adapter is a standalone tailer — it needs nothing from DSH — but DSH has two
+surfaces worth using, both verified in the shipped build:
+
+- **Skill** (primary): `.agents/skills/agtrace/SKILL.md` (or `.dsh/skills/…`)
+  in the project root, or `~/.dsh/skills/agtrace/SKILL.md` for all workspaces.
+  Hot-watched: no restart; the model loads it through the `skill` tool and users
+  can type `/agtrace`. The repo ships one at `.agents/skills/agtrace/SKILL.md`.
+- **MCP** (optional structured channel): mount `@deepseek-ai/dsh-mcp-client` via
+  a profile patch; tools appear as `mcp__<server>__<tool>`. Not shipped here.
+
+Hooks are not installed in this build; nothing in the adapter depends on them.
+No PID/process identity is persisted in session records (measured: zero `pid`
+fields in 6,276 records), so session↔process binding keeps its normal honesty
+rules: `-p <harness pid>` gives a real process tree on Linux, and without it the
+`pid_binding` note says `none` rather than pretending.
+
+### 15.5 Limits, stated
+
+- **Kernel evidence needs the harness on the same Linux host.** DSH is a desktop
+  app; on Windows the transcript half works from WSL (read `/mnt/c/...`), but WSL
+  cannot observe Windows processes' syscalls. The banner says `pid_binding=none`.
+- **Kernels before 6.8 do not expose `group_dead`** on
+  `sched_process_exit` (mainline added it in 6.8; 5.15 LTS and WSL2 lack it).
+  Both collectors now fall back to group-leader exit detection
+  (`tgid == tid`) instead of refusing to load; the aya loader states the
+  fallback on stderr. Equivalence is exact for the single-threaded commands
+  tool calls spawn; a multi-threaded target's exit may be dated from its
+  leader's exit. WSL2's 5.15 kernel additionally rejects the eBPF object at the
+  verifier — live capture there needs a ≥ 6.8 kernel; transcript-level tracing
+  is unaffected.
+- **Subagent/child sessions are peers** under the same project directory, not a
+  separate stream in the parent log. A tracer should run one adapter per file;
+  parent↔child joins (`parentSession`, `subagent/catalog`, `team/member`) are
+  recorded in the log for a future causal-tracing layer (§14) but are not
+  synthesized into events.
+- **Cross-generation reads** are not implemented: the adapter selects the
+  highest `session.vN` generation at start. DSH writes a new generation only
+  when it migrates formats; watching the session directory for that is future
+  work, not silently assumed.
+- **Live tailing against a network filesystem** inherits the usual caveats; the
+  frame scanner is structurally safe under partial reads, which is the part
+  that matters.

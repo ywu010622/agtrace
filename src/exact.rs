@@ -232,6 +232,10 @@ impl RuleHit {
 ///
 /// 只认空格做边界（不做"标点也算边界"这种自作聪明）——内核给的 argv join 用空格，
 /// 引用被 shell 吃掉之后剩下的就只有空格分隔。
+///
+/// **绝不 panic**：`from` 必须落在字符边界上。`at + 1` 在 `needle` 以多字节字符
+/// （中文/emoji）开头且第一次命中不在 token 边界时，会切到那个字符中间 ——
+/// `hay[from..]` 于是 panic，整条 live trace 崩掉（2026-10-17 审计）。
 fn contains_tokenwise(hay: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -252,7 +256,10 @@ fn contains_tokenwise(hay: &str, needle: &str) -> bool {
         if ok_before && ok_after {
             return true;
         }
-        from = at + 1;
+        // 下界必须推进到**下一个字符边界**：命中位置 `at` 是边界，但 `at + 1`
+        // 只有在命中起点是 1 字节字符时才是边界。用命中的那个字符的长度推进，
+        // 这样多字节 needle 也会安全地跳过本次命中。
+        from = at + hay[at..].chars().next().map_or(1, char::len_utf8);
         if from >= hay.len() {
             break;
         }
@@ -1239,6 +1246,22 @@ mod tests {
         assert!(match_rule("ls", false, &argv_of(&["lsblk"]), &[]).is_none());
         // 甚至不能因为前缀就认成同一个命令（basename 不同）。
         assert!(match_rule("cargo", false, &argv_of(&["cargo-nextest", "run"]), &[]).is_none());
+    }
+
+    /// 多字节 needle 的边界搜索**绝不能**切到字符中间（2026-10-17 审计：
+    /// `from = at + 1` 会在 "echo 你好世界" 里搜 "你好" 时 panic，整条 trace 崩掉）。
+    #[test]
+    fn rule_direct_multibyte_needle_never_panics() {
+        // 第一次命中的后面不是 token 边界 → 下一步不能再从 `at + 1` 起切。
+        assert!(!contains_tokenwise("echo 你好世界", "你好"));
+        // 真的在边界上时仍然要命中。
+        assert!(contains_tokenwise("bash -c 你好", "你好"));
+        assert!(contains_tokenwise("你好 世界", "你好"));
+        // 后半段还有一次合法命中：必须跳过前面那次非边界命中后找到它。
+        assert!(contains_tokenwise("echo 你好世界 你好", "你好"));
+        // 走一遍完整规则：cmd 以中文开头，exec 的 argv 只在 token 中间包含它。
+        assert!(match_rule("你好", false, &argv_of(&["echo", "你好世界"]), &[]).is_none());
+        assert!(match_rule("你好", false, &argv_of(&["echo", "你好"]), &[]).is_some());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 use super::{AdapterError, Capabilities, EventAdapter, FileTail, agent_event};
 use crate::event::{Corr, Event, Kind, Layer, Payload, TruncNote, one_line, truncate_chars};
 use crate::poll::PollOutcome;
+use crate::redact::{RedactMode, redact_text};
 use serde_json::Value;
 use std::path::Path;
 
@@ -61,6 +62,8 @@ pub struct OpenShellAdapter {
     parsed: bool,
     done: bool,
     pub tool_preview_max: usize,
+    /// How `--redact` applies to this adapter (F2: it used to not apply at all).
+    redact: RedactMode,
     pub run_id: Option<String>,
     pub agent_id: Option<String>,
     pub bad_json: u64,
@@ -69,7 +72,12 @@ pub struct OpenShellAdapter {
 }
 
 impl OpenShellAdapter {
-    pub fn new(path: &str, base: TimeBase, tool_preview_max: usize) -> Result<Self, AdapterError> {
+    pub fn new(
+        path: &str,
+        base: TimeBase,
+        tool_preview_max: usize,
+        redact: RedactMode,
+    ) -> Result<Self, AdapterError> {
         let p = Path::new(path);
         if !p.is_file() {
             return Err(AdapterError::NotFound(format!(
@@ -86,6 +94,7 @@ impl OpenShellAdapter {
             parsed: false,
             done: false,
             tool_preview_max,
+            redact,
             run_id: None,
             agent_id: None,
             bad_json: 0,
@@ -181,7 +190,9 @@ impl OpenShellAdapter {
                     )
                 }
                 "tool.invoke" => {
-                    let (p, n) = self.preview(detail, "status_detail");
+                    // `status_detail` here describes the *invocation* (often the
+                    // command line) — argv-shaped, masked under `argv` too (F2).
+                    let (p, n) = self.preview_argvish(detail, "status_detail");
                     (
                         Kind::AgentToolCall,
                         Payload::ToolCall {
@@ -250,7 +261,28 @@ impl OpenShellAdapter {
         }
     }
 
+    /// Preview for **content** fields (`llm.call` / `tool.result` detail):
+    /// masked only under `--redact argv+content`.
     fn preview(&self, s: &str, field: &str) -> (String, Vec<TruncNote>) {
+        let s = if self.redact.redacts_content() {
+            redact_text(s)
+        } else {
+            s.to_string()
+        };
+        self.preview_plain(&s, field)
+    }
+
+    /// Preview for argv-shaped fields: `--redact argv` (the default) masks too.
+    fn preview_argvish(&self, s: &str, field: &str) -> (String, Vec<TruncNote>) {
+        let s = if self.redact.redacts_argv() {
+            redact_text(s)
+        } else {
+            s.to_string()
+        };
+        self.preview_plain(&s, field)
+    }
+
+    fn preview_plain(&self, s: &str, field: &str) -> (String, Vec<TruncNote>) {
         let (cut, truncated, orig) = truncate_chars(s, self.tool_preview_max, self.tool_preview_max);
         let mut n = Vec::new();
         if truncated {
@@ -327,4 +359,117 @@ fn file_mtime_ns(p: &Path) -> Option<u64> {
     m.duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_nanos() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "sk-secret-123456";
+
+    fn run(mode: RedactMode) -> Vec<Event> {
+        // Tests run in parallel threads of one process: unique temp dir per call.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let uniq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lines = [
+            format!(
+                r#"{{"time":1.0,"agent_id":"a1","run_id":"r1","activity":"tool.invoke","tool":"Bash","status_detail":"curl -H 'Authorization: Bearer {}' https://x","status":"success"}}"#,
+                SECRET
+            ),
+            format!(
+                r#"{{"time":2.0,"agent_id":"a1","run_id":"r1","activity":"llm.call","status_detail":"plan: use token={}"}}"#,
+                SECRET
+            ),
+            format!(
+                r#"{{"time":3.0,"agent_id":"a1","run_id":"r1","activity":"tool.result","tool":"Bash","status":"success","status_detail":"output: token={}"}}"#,
+                SECRET
+            ),
+        ];
+        let dir = std::env::temp_dir().join(format!(
+            "agtrace_openshell_redact_{}_{}",
+            std::process::id(),
+            uniq
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("fixture.jsonl");
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let mut a =
+            OpenShellAdapter::new(p.to_str().unwrap(), TimeBase::Epoch, 512, mode).unwrap();
+        let mut out = Vec::new();
+        a.poll(&mut out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn call_preview(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::ToolCall { input_preview, .. } => Some(input_preview.as_str()),
+                _ => None,
+            })
+            .expect("no tool.invoke event")
+    }
+
+    fn model_detail(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::ModelRequest { detail_preview, .. } => detail_preview.as_deref(),
+                _ => None,
+            })
+            .expect("no llm.call event")
+    }
+
+    fn result_preview(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::ToolResult { result_preview, .. } => Some(result_preview.as_str()),
+                _ => None,
+            })
+            .expect("no tool.result event")
+    }
+
+    /// F2（HIGH）：`--redact argv`（默认）必须打码 `tool.invoke` 的调用详情
+    /// （它形如命令行）；`llm.call` / `tool.result` 的 detail 是 content，默认保留。
+    #[test]
+    fn argv_mode_masks_invocation_detail_only() {
+        let evs = run(RedactMode::Argv);
+        assert!(
+            !call_preview(&evs).contains(SECRET),
+            "F2: tool.invoke 详情默认未打码: {}",
+            call_preview(&evs)
+        );
+        assert!(
+            model_detail(&evs).contains(SECRET),
+            "argv 模式不得打码 llm.call content: {}",
+            model_detail(&evs)
+        );
+        assert!(
+            result_preview(&evs).contains(SECRET),
+            "argv 模式不得打码 tool.result content: {}",
+            result_preview(&evs)
+        );
+    }
+
+    /// F2（HIGH）：`--redact argv+content` 之前在这个 adapter 上是 no-op；现在
+    /// 必须把 content 也打码。
+    #[test]
+    fn argv_content_mode_masks_content() {
+        let evs = run(RedactMode::ArgvContent);
+        assert!(!call_preview(&evs).contains(SECRET), "{}", call_preview(&evs));
+        assert!(!model_detail(&evs).contains(SECRET), "{}", model_detail(&evs));
+        assert!(
+            !result_preview(&evs).contains(SECRET),
+            "{}",
+            result_preview(&evs)
+        );
+    }
+
+    /// `--redact off` 必须真的不打码。
+    #[test]
+    fn off_mode_masks_nothing() {
+        let evs = run(RedactMode::Off);
+        assert!(call_preview(&evs).contains(SECRET));
+        assert!(model_detail(&evs).contains(SECRET));
+        assert!(result_preview(&evs).contains(SECRET));
+    }
 }

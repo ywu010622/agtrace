@@ -1,4 +1,6 @@
 target/
+# Scratch workspace used for reverse-engineering / local verification (not source).
+.scratch/
 *.log
 *.status
 *.err

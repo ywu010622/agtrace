@@ -491,8 +491,24 @@ impl ClaudeCodeAdapter {
                     // `input` 是 JSON 对象 → to_string 后截断（§3.3）。
                     let serialized = serde_json::to_string(&input).unwrap_or_default();
                     let input_bytes = serialized.len();
+                    // F1（DESIGN §5.3）：`--redact argv`（**默认**）必须打码 argv 与
+                    // Bash 命令。Bash 的 `input` 就是命令行；任何工具只要 input 里带
+                    // `command`/`cmd` 键，整段 input preview 也按命令行处理 —— 否则同一
+                    // 个 secret 在这一行是明文、在下一行内核 exec argv 里却是 `***`。
+                    // prompt / thinking / tool result 是 content，仍只在 `argv+content`
+                    // 下打码，那是文档承诺的边界。
+                    let shell_tool = name == "Bash";
+                    let raw_cmd = input
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .or_else(|| input.get("cmd").and_then(|c| c.as_str()));
+                    let preview_src = if self.cfg.redact.redacts_argv() && (shell_tool || raw_cmd.is_some()) {
+                        redact_text(&serialized)
+                    } else {
+                        serialized
+                    };
                     let (mut input_preview, mut note) =
-                        self.preview(&serialized, self.cfg.tool_arg_max, "input_preview");
+                        self.preview(&preview_src, self.cfg.tool_arg_max, "input_preview");
                     // Bash 是绝对主力（本机实测 481 次，§3.3）→ `input.command` 单独
                     // 用更大的 --bash-cmd-max 上限提取。
                     //
@@ -502,19 +518,17 @@ impl ClaudeCodeAdapter {
                     // 不产生歧义 —— v0.3 会拿这个字符串去和内核 argv 精确匹配，
                     // "猜"一个错的命令行会直接变成一条错误的 exact 断言。
                     let mut bash_cmd = None;
-                    if name == "Bash" {
-                        let raw = input
-                            .get("command")
-                            .and_then(|c| c.as_str())
-                            .or_else(|| input.get("cmd").and_then(|c| c.as_str()));
-                        if let Some(cmd) = raw {
-                            let (c2, mut n2) = self.preview(cmd, self.cfg.bash_cmd_max, "bash_cmd");
-                            bash_cmd = Some(c2);
-                            note.append(&mut n2);
-                            // input_preview 保留完整 input（含其他字段如 timeout），
-                            // 但如果它太长，Bash 行会变得难读 —— 不影响正确性，保留。
-                            let _ = &mut input_preview;
-                        }
+                    if shell_tool
+                        && let Some(cmd) = raw_cmd
+                    {
+                        // 命令行字段：默认模式就按 argv 打码（F1）。
+                        let (c2, mut n2) =
+                            self.preview_argvish(cmd, self.cfg.bash_cmd_max, "bash_cmd");
+                        bash_cmd = Some(c2);
+                        note.append(&mut n2);
+                        // input_preview 保留完整 input（含其他字段如 timeout），
+                        // 但如果它太长，Bash 行会变得难读 —— 不影响正确性，保留。
+                        let _ = &mut input_preview;
                     }
                     let notes: Vec<String> = Vec::new();
                     out.push(agent_event(
@@ -550,7 +564,26 @@ impl ClaudeCodeAdapter {
         } else {
             s.to_string()
         };
-        let (cut, truncated, orig) = truncate_chars(&s, max, max);
+        self.preview_plain(&s, max, field)
+    }
+
+    /// 命令行 / argv 形态的 preview：`--redact argv`（**默认**）就打码。
+    ///
+    /// DESIGN §5.3 承诺 "credential-shaped patterns in argv **and Bash commands**
+    /// are masked" —— 命令行的凭据不能只在 `argv+content` 下才遮（F1）。
+    fn preview_argvish(&self, s: &str, max: usize, field: &str) -> (String, Vec<TruncNote>) {
+        let s = if self.cfg.redact.redacts_argv() {
+            redact_text(s)
+        } else {
+            s.to_string()
+        };
+        self.preview_plain(&s, max, field)
+    }
+
+    /// 截断 + 单行化（不含打码；打码由 [`Self::preview`] /
+    /// [`Self::preview_argvish`] 按模式决定）。
+    fn preview_plain(&self, s: &str, max: usize, field: &str) -> (String, Vec<TruncNote>) {
+        let (cut, truncated, orig) = truncate_chars(s, max, max);
         let mut notes = Vec::new();
         if truncated {
             notes.push(TruncNote::new(field, Some(orig), cut.len()));
@@ -623,6 +656,16 @@ impl EventAdapter for ClaudeCodeAdapter {
             d.push(format!(
                 "unknown transcript type(s) (counted, no event produced): {}",
                 s.join(" ")
+            ));
+        }
+        // FileTail 的重开/重读不是无声的：轮转或截断会让"这条事件出现过几次"
+        // 变成一个必须能回答的问题（§4.3）。
+        if self.tail.restarts > 0 {
+            d.push(format!(
+                "file tail: {} restart(s) (last: {}); {} possible duplicate event(s)",
+                self.tail.restarts,
+                self.tail.last_restart.as_deref().unwrap_or("-"),
+                self.tail.possible_duplicates
             ));
         }
         d
@@ -833,4 +876,223 @@ fn newest_jsonl(dir: &Path) -> Result<PathBuf, AdapterError> {
     }
     best.map(|(_, p)| p)
         .ok_or_else(|| AdapterError::NotFound(format!("no .jsonl file in directory {}", dir.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一个形如真实凭据的串。`redact_text` 只按**凭据形状**打码（header/kv/URL
+    /// userinfo/JSON），不按长度或熵猜 —— 所以测试用这些形态而不是随机长串。
+    const SECRET: &str = "sk-secret-123456";
+
+    fn cfg(mode: RedactMode) -> AdapterCfg {
+        AdapterCfg {
+            tool_arg_max: 512,
+            bash_cmd_max: 1024,
+            redact: mode,
+        }
+    }
+
+    /// `resolve_transcript()` 接受尚不存在的 `*.jsonl`（live tail 语义）；测试把
+    /// 行直接喂给 `handle_line()`，不碰磁盘。
+    fn adapter(mode: RedactMode) -> ClaudeCodeAdapter {
+        let p = std::env::temp_dir().join(format!(
+            "agtrace_cc_redact_{}_{:?}.jsonl",
+            std::process::id(),
+            mode
+        ));
+        ClaudeCodeAdapter::new(p.to_str().unwrap(), cfg(mode), true).expect("adapter")
+    }
+
+    fn secret_cmd() -> String {
+        format!("curl -H 'Authorization: Bearer {}' https://x.dev", SECRET)
+    }
+
+    /// 一条 Bash tool_use + 一条 prompt + 一条 tool_result（真实 transcript 顺序）。
+    fn run(mode: RedactMode) -> Vec<Event> {
+        let mut a = adapter(mode);
+        let mut out = Vec::new();
+        let call = format!(
+            r#"{{"type":"assistant","uuid":"u1","timestamp":"2026-10-11T20:00:00.000Z","message":{{"id":"m1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"{}"}}}}]}}}}"#,
+            secret_cmd()
+        );
+        let prompt = format!(
+            r#"{{"type":"user","uuid":"u2","timestamp":"2026-10-11T20:00:01.000Z","message":{{"content":"my command was: {}"}}}}"#,
+            secret_cmd()
+        );
+        let result = format!(
+            r#"{{"type":"user","uuid":"u3","timestamp":"2026-10-11T20:00:02.000Z","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1","content":"output from {}"}}]}}}}"#,
+            secret_cmd()
+        );
+        for line in [call, prompt, result] {
+            a.handle_line(&line, &mut out);
+        }
+        out
+    }
+
+    fn tool_call(evs: &[Event]) -> &Payload {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                p @ Payload::ToolCall { .. } => Some(p),
+                _ => None,
+            })
+            .expect("no tool.call event")
+    }
+
+    fn prompt_text(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::Prompt { text_preview, .. } => Some(text_preview.as_str()),
+                _ => None,
+            })
+            .expect("no prompt event")
+    }
+
+    fn result_preview(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::ToolResult { result_preview, .. } => Some(result_preview.as_str()),
+                _ => None,
+            })
+            .expect("no tool.result event")
+    }
+
+    /// F1（HIGH）：默认 `--redact argv` 下，Bash 命令行和含命令的 input preview
+    /// 必须打码；prompt / tool result 是 content，保持明文（文档承诺的边界）。
+    #[test]
+    fn default_argv_mode_masks_bash_command_and_input_preview() {
+        let evs = run(RedactMode::Argv);
+        match tool_call(&evs) {
+            Payload::ToolCall {
+                tool,
+                bash_cmd,
+                input_preview,
+                ..
+            } => {
+                assert_eq!(tool, "Bash");
+                let cmd = bash_cmd.as_deref().expect("Bash must have bash_cmd");
+                assert!(!cmd.contains(SECRET), "F1: Bash 命令行默认未打码: {}", cmd);
+                assert!(cmd.contains("***"), "打码必须留痕: {}", cmd);
+                assert!(
+                    !input_preview.contains(SECRET),
+                    "F1: Bash input_preview 默认未打码: {}",
+                    input_preview
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+        assert!(prompt_text(&evs).contains(SECRET), "argv 模式不得打码 prompt");
+        assert!(
+            result_preview(&evs).contains(SECRET),
+            "argv 模式不得打码 tool result"
+        );
+    }
+
+    /// `--redact argv+content` 额外打码 agent 层内容；命令行仍然打码。
+    #[test]
+    fn argv_content_mode_also_masks_content() {
+        let evs = run(RedactMode::ArgvContent);
+        match tool_call(&evs) {
+            Payload::ToolCall {
+                bash_cmd,
+                input_preview,
+                ..
+            } => {
+                assert!(!bash_cmd.as_deref().unwrap().contains(SECRET));
+                assert!(!input_preview.contains(SECRET));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+        assert!(!prompt_text(&evs).contains(SECRET), "{}", prompt_text(&evs));
+        assert!(
+            !result_preview(&evs).contains(SECRET),
+            "{}",
+            result_preview(&evs)
+        );
+    }
+
+    /// `--redact off` 必须真的不打码（用户显式关掉时不自作主张）。
+    #[test]
+    fn off_mode_masks_nothing() {
+        let evs = run(RedactMode::Off);
+        match tool_call(&evs) {
+            Payload::ToolCall {
+                bash_cmd,
+                input_preview,
+                ..
+            } => {
+                assert!(bash_cmd.as_deref().unwrap().contains(SECRET));
+                assert!(input_preview.contains(SECRET));
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+        assert!(prompt_text(&evs).contains(SECRET));
+        assert!(result_preview(&evs).contains(SECRET));
+    }
+
+    /// 非命令行工具的 input 属于 content：`argv` 模式**不**打码，`argv+content`
+    /// 才打码 —— F1 要求的最小作用域（不能把 agent 内容当 argv 打）。
+    #[test]
+    fn non_command_tool_input_is_content_scoped() {
+        let line = r#"{"type":"assistant","uuid":"u9","timestamp":"2026-10-11T20:00:00.000Z","message":{"id":"m2","content":[{"type":"tool_use","id":"t9","name":"Write","input":{"file_path":"/tmp/x","content":"password=hunter2"}}]}}"#;
+        let mut a = adapter(RedactMode::Argv);
+        let mut out = Vec::new();
+        a.handle_line(line, &mut out);
+        match tool_call(&out) {
+            Payload::ToolCall {
+                input_preview,
+                bash_cmd,
+                ..
+            } => {
+                assert!(bash_cmd.is_none(), "Write 不应有 bash_cmd");
+                assert!(
+                    input_preview.contains("hunter2"),
+                    "argv 模式下 content input 不该被打码: {}",
+                    input_preview
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+
+        let mut a = adapter(RedactMode::ArgvContent);
+        let mut out = Vec::new();
+        a.handle_line(line, &mut out);
+        match tool_call(&out) {
+            Payload::ToolCall { input_preview, .. } => assert!(
+                !input_preview.contains("hunter2"),
+                "argv+content 下 content input 必须打码: {}",
+                input_preview
+            ),
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    /// 非 Bash 名称但 input 里带 `command`：整段 input preview 也按命令行处理
+    /// （F1：“for the whole input when it contains the command”）。
+    #[test]
+    fn generic_tool_input_with_command_is_masked_in_argv_mode() {
+        let line = format!(
+            r#"{{"type":"assistant","uuid":"u10","timestamp":"2026-10-11T20:00:00.000Z","message":{{"id":"m3","content":[{{"type":"tool_use","id":"t10","name":"Shell","input":{{"command":"tool --token={}"}}}}]}}}}"#,
+            SECRET
+        );
+        let mut a = adapter(RedactMode::Argv);
+        let mut out = Vec::new();
+        a.handle_line(&line, &mut out);
+        match tool_call(&out) {
+            Payload::ToolCall {
+                input_preview,
+                bash_cmd,
+                ..
+            } => {
+                assert!(bash_cmd.is_none(), "只有 Bash 才产出 bash_cmd");
+                assert!(
+                    !input_preview.contains(SECRET),
+                    "含 command 的 input 在 argv 模式下必须打码: {}",
+                    input_preview
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
 }

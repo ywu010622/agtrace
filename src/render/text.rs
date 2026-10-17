@@ -370,6 +370,16 @@ impl TextRenderer {
             colorize(&self.opts, RED, &format!("--- failures ({}):", n))
         ));
         for (f, t) in ev.failures.iter().zip(times.iter()) {
+            // footer 是**第二个**输出口：时间线行在 `render_one` 的出口统一过
+            // `one_line` 闸门，footer 之前没有。而这里承载的同样是不可信文本 ——
+            // `f.tool` 直接来自 transcript（tool_use.name），`head`/`lineage`/
+            // `claims`/`sniff` 来自结果文本。少了这一步，一个带 ESC 的 tool 名就能在
+            // footer 里注入终端序列（改标题、清屏），而同一串在时间线行里是转义的。
+            // 因此在进模板之前统一过同一个闸门；`one_line` 对已转义串是幂等的。
+            let tool = crate::event::one_line(&f.tool);
+            let cmd = crate::event::one_line(&f.cmd);
+            let head = crate::event::one_line(&f.head);
+            let deepest = f.deepest.as_deref().map(crate::event::one_line);
             // 先按**纯文本**限宽再上色。反过来会把转义序列算进列宽里，于是带颜色的
             // 那一版比无色版更早被截断 —— 同一个终端宽度下，`--no-color` 和默认
             // 输出会显示不同长度的命令，那是最难查的一类不一致。
@@ -377,12 +387,12 @@ impl TextRenderer {
             // 列预算与时间线共用同一套分配（`fit_fail`）：footer 只是行首短得多，
             // 于是 `deepest` 通常能整段放下 —— 这正是"时间线上看不全的东西到
             // footer 里一定看得全"这句话的兑现方式。
-            let prefix = format!("  {:>w$}  {} \"", t, f.tool, w = w);
+            let prefix = format!("  {:>w$}  {} \"", t, tool, w = w);
             let body = fit_fail(
                 &prefix,
-                &f.cmd,
-                &format!("\" -> {}", f.head),
-                &match &f.deepest {
+                &cmd,
+                &format!("\" -> {}", head),
+                &match &deepest {
                     Some(d) => format!(" (deepest: {})", d),
                     None => String::new(),
                 },
@@ -397,16 +407,17 @@ impl TextRenderer {
             // `userspace inference`）由 `lineage.rs` 生成，渲染层不加不减 ——
             // 这一层一旦"顺手润色"，屏幕上就会出现比账里更硬的话。
             for l in &f.lineage {
-                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, l))));
+                let line = crate::event::one_line(l);
+                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, line))));
             }
             // v0.6 §14.2：其余几列对账。`!!` 的那一行已经在 `f.head` 里了，
             // 这里补的是同一次结果里的**其它** claim（一行结果可以既说写了文件
             // 又说下了 URL），它们不是失败，所以用暗色。
             for c in &f.claims {
-                let line = c.render();
+                let line = crate::event::one_line(&c.render());
                 // 第一列已经是这一行的 `head`（`-> claim: ... !!`）—— 再打一遍
                 // 是同一句话说两次，而失败段的价值就在于每一行都值得读。
-                if line == f.head {
+                if line == head {
                     continue;
                 }
                 s.push_str(&format!(
@@ -417,7 +428,8 @@ impl TextRenderer {
             // v0.6 §14.3：内容嗅探。**用户态启发式** —— 句子自己带着这句话
             //（由 `lineage::sniff` 保证），这里只负责缩进。
             for x in &f.sniff {
-                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, x))));
+                let line = crate::event::one_line(x);
+                s.push_str(&format!("{}\n", colorize(&self.opts, DIM, &format!("{}{}", INDENT, line))));
             }
         }
         if !ev.kernel_available {
@@ -979,5 +991,96 @@ mod tests {
             .push(crate::event::TruncNote::new("input_preview", Some(900), 512));
         let mk = markers(&e);
         assert!(mk.is_ascii(), "标记必须全 ASCII: {:?}", mk);
+    }
+
+    /// 一条长到能填满 footer 预算的失败记录。`tool` 由调用方给，方便测不可信文本。
+    fn failure_fixture(tool: &str) -> crate::fail::Failure {
+        crate::fail::Failure {
+            ts_wall_ns: 1_700_000_000_000_000_000,
+            ts_ns: 0,
+            step: 1,
+            tool: tool.to_string(),
+            cmd: "a-very-long-command-".repeat(18),
+            head: "exit 2 (deepest: openat /tmp/x ENOENT)".into(),
+            deepest: Some("openat /tmp/x ENOENT".into()),
+            class: "kernel".into(),
+            detected_by: "status=Failure".into(),
+            tool_use_id: None,
+            kernel_events: 2,
+            lineage: Vec::new(),
+            claims: Vec::new(),
+            sniff: Vec::new(),
+        }
+    }
+
+    fn summary_with_failure(f: crate::fail::Failure) -> Summary {
+        let mut s = Summary {
+            total: 1,
+            first_wall: Some(f.ts_wall_ns),
+            last_wall: Some(f.ts_wall_ns),
+            ..Default::default()
+        };
+        s.failures.push(f);
+        s
+    }
+
+    /// footer 是**另一个**输出口：tool 名/结果文本来自不可信 transcript，必须和
+    /// 时间线行一样过 `one_line` 闸门。回归用例：一个带 ESC 的 tool 名。
+    #[test]
+    fn footer_escapes_control_sequences_from_untrusted_text() {
+        let r = TextRenderer::new(RenderOpts::default());
+        let mut f = failure_fixture("Bash\u{1b}[2J\u{7}");
+        f.lineage = vec!["input /tmp/x produced by step 1 Bash\u{1b}]0;pwned\u{7}".into()];
+        f.sniff = vec!["(userspace heuristic) /tmp/x.pdf smells like HTML\u{1b}[2J".into()];
+        let out = r.summary(&summary_with_failure(f));
+        assert!(
+            !out.contains('\u{1b}'),
+            "footer 里不得出现裸 ESC（终端注入原语）: {:?}",
+            out
+        );
+        assert!(out.contains("\\x1b[2J"), "转义后必须仍能看见原文: {:?}", out);
+        assert!(out.contains("Bash"), "tool 名不能因为转义整段消失: {:?}", out);
+    }
+
+    /// §3 的 120 列上限按**可见列**算。summary 是先着色再 `cap_lines` 的，
+    /// 若把 ANSI 当可见宽度，同一行在 tty（默认着色）上会比 `--no-color` 少
+    /// 8–9 列并多出一个假的 `~`。修复后两者可见文本必须逐字节相同。
+    #[test]
+    fn colored_summary_keeps_the_same_visible_width_as_no_color() {
+        let s = summary_with_failure(failure_fixture("Bash"));
+        let plain = TextRenderer::new(RenderOpts::default()).summary(&s);
+        let colored = TextRenderer::new(RenderOpts {
+            color: true,
+            ..Default::default()
+        })
+        .summary(&s);
+
+        let visible = strip_ansi(&colored);
+        assert_eq!(visible, plain, "着色不得改变可见文本（截断位置必须一致）");
+        for (a, b) in visible.lines().zip(plain.lines()) {
+            assert_eq!(
+                display_width(a),
+                display_width(b),
+                "可见列宽不一致: {:?} vs {:?}",
+                a,
+                b
+            );
+        }
+        assert!(
+            plain.lines().any(|l| display_width(l) > 110),
+            "测试必须真的碰到接近 120 列的 footer 行: {:?}",
+            plain
+        );
+        assert!(
+            plain.lines().all(|l| display_width(l) <= MAX_COLS),
+            "footer 行超过 {} 列: {:?}",
+            MAX_COLS,
+            plain
+        );
+        // 被截断的彩色行不能在行尾留下半个转义序列。
+        for line in colored.lines() {
+            assert!(!line.ends_with('\u{1b}'), "半个转义序列: {:?}", line);
+            assert!(!line.ends_with("\u{1b}["), "半个 CSI: {:?}", line);
+        }
     }
 }

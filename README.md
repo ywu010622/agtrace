@@ -19,11 +19,13 @@ agtrace only **presents**. It never throttles, kills, edits config, or auto-reme
 ## Features
 
 - **Unified live timeline** — agent, runtime, infra, and policy layers on a single clock
+- **Adapters** — Claude Code transcripts, DeepSeek Harness session logs (live zstd frame tail), a generic JSONL protocol for LangChain/LangGraph/anything, and an openshell fixture
 - **tool.call ↔ exec binding** — every Bash call linked to its real `execve`; the match rule is shown honestly (`exact` / `substring` / `segment`), bound subtrees marked `=`
 - **Failure attribution** — each failed call traced to its deepest evidence layer: `BEFORE exec` (sandbox init failed / command not found), `kernel` (exit status + linked syscalls); one red `XX` line per failure, plus a `--- failures (N)` summary footer
 - **Watchlist** — sensitive files, exfiltration patterns, destructive commands surface in red (alert-only)
 - **Noise folding** — `execvp` PATH probes and fork bursts collapsed to one derived line (`--no-collapse` restores the raw firehose)
 - **Credential redaction** on by default (`--redact off|argv|argv+content`)
+- **Transcript-only mode** — `-S` without `-p` needs neither root nor eBPF: the agent layer, derived views and JSON output still work
 
 ## Quickstart
 
@@ -32,6 +34,9 @@ agent session to watch. Nothing else: the eBPF programs are loaded in-process by
 [aya](https://aya-rs.dev), so `bpftrace` is not a dependency. It is still
 supported as a fallback backend (`--collector bpftrace`) and used automatically
 only if the aya collector cannot start — with a note on stderr when that happens.
+The agent layer alone (`-S` without `-p`/`-C`) runs unprivileged and on any
+platform where the binary builds; on WSL it can tail a Windows-side DeepSeek
+Harness session log read-only.
 
 ```bash
 cargo install --git https://github.com/ywu010622/agtrace
@@ -115,11 +120,64 @@ One JSON object per line; `ts` is ISO8601 or epoch seconds (missing = read time)
 For `tool.call`, `command` carries the shell command so argv binding works; other
 tools correlate by time. Full schema: `src/adapter/jsonl.rs`.
 
+## DeepSeek Harness (`--adapter dsh`)
+
+DeepSeek Harness (DSH) writes each session to an append-only
+`session.v4.jsonl.zstd` log: a concatenation of independent checksummed
+Zstandard frames (one header frame, then one frame per 200 ms append batch).
+`--adapter dsh` tails that container frame-by-frame, so the timeline appears
+while the agent is still working.
+
+```bash
+# inside a DSH tool shell, or with DSH_HOME set: auto = current session
+agtrace --adapter dsh -S auto -f
+
+# or point at a session id / log path / workspace directly
+agtrace --adapter dsh -S session-e8694b65 -f
+agtrace --adapter dsh -S ~/.dsh/sessions/--home-me-proj--/session-…/session.v4.jsonl.zstd
+```
+
+What it maps: `user/message` → `agent.prompt`, `assistant/message` →
+`agent.model.request` (derived once per step) / `agent.model.thinking` /
+`agent.model.text`, `tool/call` → `agent.tool.call`, `tool/result` →
+`agent.tool.result`. Harness-internal records (`step/*`, `job/*`, `request/*`,
+team/subagent, approvals, …) are counted under `-v`, never mis-mapped.
+
+**Honesty detail that matters for DSH:** a failed shell command does *not* set
+`tool.result.isError` — the exit code lives in `job/settled.detail`
+(`exit code: N`). agtrace reads that authoritative field, classifies the call as
+`Failure`, and puts the disagreement in the event's `notes`; the text marker
+`[exit code: N]` is only a fallback.
+
+Discovery: `-S auto` uses `$DSH_SESSION_ID` when the harness exported it, else the
+newest session of the current workspace, else the newest overall. The sessions
+root is `$DSH_SESSIONS_ROOT` → `$DSH_HOME/sessions` → `~/.dsh/sessions`; on WSL it
+also finds `<drive>:\Users\<user>\.dsh\sessions`. `projectKey()` (the
+`--C-Users-me-proj--` directory naming), UTF-16 `~XXXX` escaping and generation
+selection (`session.vN`) are ported from DSH's own persistence backend.
+
+For DSH agents, a ready-made skill lives in
+[`.agents/skills/agtrace/SKILL.md`](.agents/skills/agtrace/SKILL.md) (DSH
+discovers `.agents/skills/` and `.dsh/skills/` in the project root, hot-reloaded):
+copy it into a workspace, or `~/.dsh/skills/agtrace/SKILL.md` to make it available
+everywhere, and the model can call it via the `skill` tool (humans: `/agtrace`).
+
+Platform note: the transcript half is portable and works from WSL against the
+Windows app's session logs. Kernel evidence (`-p`) is Linux-only — WSL cannot
+observe Windows processes' syscalls — and WSL2's 5.15 kernel additionally
+rejects the in-process eBPF object at the verifier, so live capture needs a
+Linux host (or VM/distro) on kernel ≥ 6.8. Kernels whose
+`sched_process_exit` tracepoint lacks `group_dead` (< 6.8, including WSL's
+5.15) are handled by a group-leader fallback in both collectors instead of
+failing to load.
+
 ## Status
 
-v0.5.0. Adapters: Claude Code (live), generic jsonl (LangChain/LangGraph/any). Single
-static Rust binary; `cargo test` green (223 tests) plus a `tests/real_cases.sh`
-regression suite replaying real captured sessions.
+v0.7.0. Adapters: Claude Code (live), DeepSeek Harness (live zstd frame tail),
+generic jsonl (LangChain/LangGraph/any), openshell fixture. Single static Rust
+binary; `cargo test` covers the unit suites plus `tests/inject.rs` (offline
+kernel-line replay, 9 seeds) and `tests/dsh_e2e.rs` (synthetic DSH frame
+streams), and `tests/real_cases.sh` replays real captured sessions.
 
 Building from source needs two things beyond a stable toolchain: a **nightly**
 toolchain (the eBPF crate is `no_std` and uses `-Z build-std=core`) and

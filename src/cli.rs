@@ -202,16 +202,21 @@ Target (give at least one; -p and -C are mutually exclusive):
                            the machine that captured it, so cross-layer ordering is only
                            trustworthy for a same-boot capture; parsing, binding and
                            attribution are byte-for-byte the live code paths.
-  -S, --session <ID|PATH>  follow the agent layer (Claude Code session id or transcript path)
+  -S, --session <ID|PATH>  follow the agent layer (adapter-specific: Claude Code session id or
+                           transcript path; DSH session id, log path, workspace dir, or
+                           `auto` = newest session of the current workspace)
                            combine with -p/-C to get a merged timeline
+      --transcript <PATH>  alias for -S (agent source path); -S wins if both are given
 
   With no target, agtrace exits with an error — it never does system-wide tracing,
   which amounts to tracing without a filter.
 
 Behavior:
   -f, --follow             live tail (without it, stop at EOF — for offline fixtures)
-      --adapter <NAME>     claude-code | openshell | jsonl  (default claude-code)
-      --transcript <PATH>  explicit transcript file or directory
+      --adapter <NAME>     claude-code | dsh | openshell | jsonl  (default claude-code)
+                           dsh: DeepSeek Harness session logs (`session.vN.jsonl.zstd`), which
+                           are concatenated Zstandard frames and are tailed frame-by-frame
+                           while the harness appends.
       --time-base <MODE>   fixture time anchor: now | wall | epoch   (default now)
       --source <LIST>      comma-separated: exec,file,net,agent      (default all)
       --collector <NAME>   aya | bpftrace  (default aya)
@@ -398,6 +403,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     }
 
     // ---- 目标校验（§4.1：不给目标就报错退出）----
+    // `--adapter` 的名字在解析期就校验：`--adapter dsh -p 123` 这种"名字打错但
+    // 有内核目标所以静默忽略 adapter"的组合，只会让用户以为 agent 层被接上了。
+    const ADAPTERS: [&str; 4] = ["claude-code", "dsh", "openshell", "jsonl"];
+    if !ADAPTERS.contains(&cli.adapter.as_str()) {
+        return Err(format!(
+            "unknown --adapter `{}` (available: {})",
+            cli.adapter,
+            ADAPTERS.join(" | ")
+        ));
+    }
     if cli.pid.is_some() && cli.cgroup.is_some() {
         return Err(
             "-p/--pid and -C/--cgroup are mutually exclusive: both are kernel-level targets.\n\
@@ -405,15 +420,27 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 .into(),
         );
     }
+    // `--transcript` is an alias for `-S` (§4.1): either one names the agent source.
+    if cli.adapter != "claude-code"
+        && cli.session.is_none()
+        && cli.transcript.is_none()
+        && (cli.pid.is_some() || cli.cgroup.is_some())
+    {
+        return Err(format!(
+            "--adapter {} needs an agent source: add -S/--session (or --transcript)",
+            cli.adapter
+        ));
+    }
     // `--kernel-lines` 也是内核源（回放一份已采到的内核行），所以它单独出现时
     // 同样是一个**完整的目标** —— 下面的"回放与实时互斥"校验会接管剩下的规则。
     if cli.pid.is_none()
         && cli.cgroup.is_none()
         && cli.session.is_none()
+        && cli.transcript.is_none()
         && cli.kernel_lines.is_none()
     {
-        return Err("you must specify a target: -p/--pid, -C/--cgroup, -S/--session or \
-             --kernel-lines.\n\
+        return Err("you must specify a target: -p/--pid, -C/--cgroup, -S/--session \
+             (or --transcript), or --kernel-lines.\n\
              agtrace never traces system-wide — an unfiltered openat would drown\n\
              the timeline within seconds."
             .into());
@@ -488,6 +515,49 @@ mod tests {
             Parsed::Run(c) => assert_eq!(c.session.as_deref(), Some("/tmp/t.jsonl")),
             _ => panic!(),
         }
+    }
+
+    /// `--transcript` 是 `-S` 的别名（v0.6.2）：它曾经解析后被丢弃，
+    /// 于是 `agtrace --transcript x` 连目标校验都过不了。
+    #[test]
+    fn transcript_alone_is_a_valid_target() {
+        match p(&["agtrace", "--transcript", "/tmp/t.jsonl"]).unwrap() {
+            Parsed::Run(c) => {
+                assert_eq!(c.transcript.as_deref(), Some("/tmp/t.jsonl"));
+                assert!(c.session.is_none());
+            }
+            _ => panic!("应当解析成 Run"),
+        }
+    }
+
+    #[test]
+    fn dsh_adapter_accepts_auto_and_session_paths() {
+        match p(&["agtrace", "--adapter", "dsh", "-S", "auto", "-f"]).unwrap() {
+            Parsed::Run(c) => {
+                assert_eq!(c.adapter, "dsh");
+                assert_eq!(c.session.as_deref(), Some("auto"));
+            }
+            _ => panic!(),
+        }
+        // 会话 id / workspace 目录都在同一个 -S 槽位里。
+        assert!(p(&["agtrace", "--adapter", "dsh", "-S", "session-e8694b65"]).is_ok());
+        assert!(p(&["agtrace", "--adapter", "dsh", "-S", "C:\\Users\\x\\projects"]).is_ok());
+    }
+
+    #[test]
+    fn unknown_adapter_is_rejected_at_parse_time() {
+        let e = p(&["agtrace", "--adapter", "bogus", "-S", "x"]).err().unwrap();
+        assert!(e.contains("unknown --adapter"), "{}", e);
+        assert!(e.contains("dsh"), "the error must list the available adapters: {}", e);
+    }
+
+    /// 名字打错但恰好有内核目标时，不能静默忽略 adapter。
+    #[test]
+    fn adapter_without_agent_source_is_rejected() {
+        let e = p(&["agtrace", "--adapter", "dsh", "-p", "1"]).err().unwrap();
+        assert!(e.contains("needs an agent source"), "{}", e);
+        // 默认 adapter 与 -p 组合仍然合法（纯内核跟踪）。
+        assert!(p(&["agtrace", "-p", "1"]).is_ok());
     }
 
     /// `--kernel-lines` 自己就是一个完整目标：离线回放一份已采到的内核行，

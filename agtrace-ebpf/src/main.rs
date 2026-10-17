@@ -485,11 +485,21 @@ pub fn on_fork(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "sched_process_exit", category = "sched")]
 pub fn on_exit(ctx: TracePointContext) -> u32 {
-    let (pid, _tid) = ids();
+    let (pid, tid) = ids();
     if !matches(pid) {
         return 0;
     }
-    let group_dead = field(&ctx, CFG_EXIT_GROUP_DEAD) != 0;
+    // Kernels before 6.8 (including WSL2's 5.15) do not expose `group_dead` on
+    // this tracepoint. In that case userspace sets the fallback flag and points
+    // the offset slot at a valid field (`pid`) so the read below stays in
+    // bounds; the value is unused. `tgid == tid` means the exiting task is the
+    // group leader, which is the same event for the single-threaded commands
+    // tool calls spawn. See `CFG_EXIT_GROUP_DEAD_FALLBACK` in the shared crate.
+    let group_dead = if cfg(CFG_EXIT_GROUP_DEAD_FALLBACK) != 0 {
+        pid == tid
+    } else {
+        field(&ctx, CFG_EXIT_GROUP_DEAD) != 0
+    };
 
     // `sched_process_exit` fires for *every* thread, but the row it feeds — `EXIT`,
     // i.e. `runtime.proc.exit` — says "the process exited", and userspace hangs it

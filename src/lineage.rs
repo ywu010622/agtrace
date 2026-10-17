@@ -6,21 +6,31 @@
 //!
 //! 三件事，边界要说清：
 //!
-//! 1. [`Lineage`] —— **产物**（transcript 里出现过的绝对路径 / URL）与"第一次提到
-//!    它的那次 `tool.call` 就是产出者"这个映射。失败视图里那条
-//!    `└─ input /tmp/report.pdf produced by step 3 fetch_pdf (ERRORED: 404)` 来自这里。
-//!    这是**用户态推断**：依据只是"前后两次提到同一个字符串"。它没有内核证据，
-//!    所以每条血缘行都在 `notes` 里写明这一点，措辞里也带着 `produced by step N`
-//!    这种"我在引用第几步"的句式，而不是"这个文件是第 3 步写的"这种事实断言。
+//! 1. [`Lineage`] —— **产物**（transcript 里出现过的绝对路径 / URL）与"谁产出了它"
+//!    的映射。失败视图里那条 `└─ input /tmp/report.pdf produced by step 3 fetch_pdf
+//!    (ERRORED: 404)` 来自这里。
+//!
+//!    **产出者 ≠ 第一次提到它的人**（2026-10-17 审计）：一个 `Read /tmp/report.pdf`
+//!    或 `grep /tmp/report.pdf` 只是在参数里提到了这个路径，它没有产出它。只有
+//!    带生产证据的步骤才算产出者：结果文本里有产出动词且**调用成功**，或者这次
+//!    调用本身有**写意图**（`Write`/`Edit` 工具，shell 里的 `> f` / `curl -o f`）。
+//!    只有"提到"证据时，行文说 `first mentioned by step N`，不说 `produced by`。
+//!    这是**用户态推断**：依据只是"前后两次提到同一个字符串"，没有内核证据；
+//!    所以每条血缘行都在 `notes` 里写明这一点，措辞用"我在引用第几步"的句式，
+//!    而不是"这个文件是第 3 步写的"这种事实断言。
 //!
 //! 2. **claim 抽取**（[`claims`]）—— `tool.result` 的**文本**说它写了哪个文件、
 //!    下了哪个 URL。判据是一个小型动词表 + 紧邻窗口，属于启发式；它只负责
 //!    "transcript 这一侧说了什么"，不做任何判断。
 //!
 //! 3. **对账**（[`evaluate`]）—— 把 claim 与"这条调用挂住的内核事件"并排成两列。
-//!    不一致时打 `!!`。**否定陈述的门槛与 §13 的楔形视图完全一致**：只有
-//!    "这一轮有内核源" **且** "这条调用确实被连上了（有 join key 的内核事件，
-//!    或会话级 pid 绑定是 exact/heuristic）"时，才允许说"内核里没看见"。
+//!    不一致时打 `!!`。**否定陈述的门槛**：只有"这一轮有内核源" **且**
+//!    "这条调用确实被连上了（有 join key 的内核事件）"时，才允许说"内核里没看见"。
+//!    会话级 pid 绑定**单独不够**：本模块的事实集只由带 join key 的内核行填充
+//!    （`fail.rs::Evidence::kb`），一条没被 argv 绑定的调用，它的事实集恒为空；
+//!    拿空集说"内核里没有这笔写"等于把"我们没连上"说成"这件事没发生"。v0.6 的
+//!    "第二个门"（`session_linked + in_window`）正是这样把诚实调用误报成
+//!    `!!` 的，2026-10-17 审计后收紧为只认 `linked`。
 //!    门槛不满足时**一行都不产出**。这里要诚实：不产出本身**分不清**
 //!    "核对了、没问题"和"没资格核对"—— 说清这件事的责任落在调用方
 //!    （`fail.rs`）：它把两者分别计数，`-v` 里按 `checked / matched / unverified`
@@ -355,6 +365,16 @@ pub struct Step {
     pub result: String,
 }
 
+/// 一个产物的产出者记录。
+#[derive(Debug, Clone, Copy)]
+struct Producer {
+    /// 产出者所在步的下标。
+    idx: usize,
+    /// 有没有**生产证据**（成功结果的产出动词，或写意图调用）。
+    /// `false` = 这是这个字符串第一次出现的那一步，但它只是**提到**（消费者）。
+    produced: bool,
+}
+
 /// 步号计数器 + 产物 → 产出者映射。
 ///
 /// 步号就是"这是本次会话的第几次 `tool.call`"，从 1 数起，**全部**调用都数
@@ -364,8 +384,8 @@ pub struct Step {
 pub struct Lineage {
     steps: Vec<Step>,
     by_key: HashMap<String, usize>,
-    /// 产物键 → 第一次提到它的那一步（下标）。
-    producers: HashMap<String, usize>,
+    /// 产物键 → 产出者（或第一次提到它的那一步，`produced = false`）。
+    producers: HashMap<String, Producer>,
     /// 每个产物被哪些步提到过（含产出者自己），按步号递增。
     mentions: HashMap<String, Vec<usize>>,
 }
@@ -380,17 +400,25 @@ impl Lineage {
     /// `key` 必须与 `fail.rs` 的 `call_key` 用同一套（有 id 用 id，没有用
     /// `#<序号>`）—— 两条模块各自维护一套键就会在"没有 tool_use_id 的 adapter"
     /// 上悄悄错位。
-    pub fn on_call(&mut self, key: &str, tool: &str, args: &str, ts_wall_ns: u64) -> u64 {
+    ///
+    /// `bash_cmd` 是 shell 调用的原始命令行（adapter 单独提取的那一份）：
+    /// 血缘靠它判断这次调用有没有**写意图**，从而区分"产出者"和"只是提到过"。
+    pub fn on_call(
+        &mut self,
+        key: &str,
+        tool: &str,
+        args: &str,
+        bash_cmd: Option<&str>,
+        ts_wall_ns: u64,
+    ) -> u64 {
         let artifacts = extract(args);
         let idx = self.steps.len();
         let n = idx as u64 + 1;
+        let write_intent = tool_has_write_intent(tool, bash_cmd);
         for a in &artifacts {
-            let k = a.key();
-            self.producers.entry(k.clone()).or_insert(idx);
-            let m = self.mentions.entry(k).or_default();
-            if m.last() != Some(&idx) {
-                m.push(idx);
-            }
+            // 写意图调用在**调用时刻**就是产出者（哪怕结果还没到/失败了）：
+            // "produced by step N (ERRORED: …)" 正是失败链要连起来的那句话。
+            self.record_mention(a.key(), idx, write_intent);
         }
         self.by_key.insert(key.to_string(), idx);
         self.steps.push(Step {
@@ -406,12 +434,37 @@ impl Lineage {
         n
     }
 
+    /// 登记一次"提到这个产物"。
+    ///
+    /// - 第一次提到它的步骤成为候选产出者（`produced = false`，即"只是提到"）；
+    /// - 后来带生产证据的步骤可以**升级**候选（消费者先读到、产出者后写的顺序
+    ///   在真实会话里很常见，v0.6 之前会把消费者永久记成产出者）；
+    /// - 已经有生产证据的步骤不会被后来的失败/提及降级。
+    fn record_mention(&mut self, k: String, idx: usize, produced: bool) {
+        match self.producers.get_mut(&k) {
+            Some(p) => {
+                if produced && !p.produced {
+                    p.idx = idx;
+                    p.produced = true;
+                }
+            }
+            None => {
+                self.producers.insert(k.clone(), Producer { idx, produced });
+            }
+        }
+        let m = self.mentions.entry(k).or_default();
+        if m.last() != Some(&idx) {
+            m.push(idx);
+        }
+    }
+
     /// 一条 `tool.result`。
     ///
     /// 结果文本里**带产出动词**的产物也算这次调用产出的（`curl` 的输出说明
-    /// `Saved to /tmp/x.pdf`），但只在"此前没人认领"时才登记 —— 先提到的那个
-    /// 调用才是产出者。动词门槛是必须的：`ls /tmp` 的输出里全是路径，
-    /// 不加门槛的话每次 `ls` 都会变成一堆文件的"产出者"。
+    /// `Saved to /tmp/x.pdf`），但只有**成功**的结果才算生产证据 —— 失败结果里的
+    /// "Error writing /tmp/x" 只说明它提到过这个路径，不能当产出者。
+    /// 动词门槛是必须的：`ls /tmp` 的输出里全是路径，不加门槛的话每次 `ls`
+    /// 都会变成一堆文件的"产出者"。
     pub fn on_result(&mut self, key: &str, status_ok: bool, error_note: Option<String>, text: &str) {
         let Some(&idx) = self.by_key.get(key) else {
             return;
@@ -419,16 +472,7 @@ impl Lineage {
         let claims = claims(text);
         let produced: Vec<Artifact> = claims.iter().filter_map(|c| c.artifact.clone()).collect();
         for a in &produced {
-            let k = a.key();
-            // 只在"此前没人提到过"时才认领：`mentions` 是这条断言的判据
-            // （它在 on_call 里对同一批产物一起填，所以包含关系是 producers ⊆ mentions）。
-            if !self.mentions.contains_key(&k) {
-                self.producers.insert(k.clone(), idx);
-            }
-            let m = self.mentions.entry(k).or_default();
-            if m.last() != Some(&idx) {
-                m.push(idx);
-            }
+            self.record_mention(a.key(), idx, status_ok);
         }
         let st = if status_ok {
             Status::Ok
@@ -454,8 +498,11 @@ impl Lineage {
     }
 
     /// 一个产物的产出者（步号 + 工具名 + 状态）。
+    ///
+    /// 返回的是"第一次提到 / 产出它的那一步"；它**有没有**生产证据由
+    /// `Producer::produced` 决定（见 [`Lineage::chain`] 的措辞）。
     fn producer_of(&self, key: &str) -> Option<&Step> {
-        self.producers.get(key).map(|i| &self.steps[*i])
+        self.producers.get(key).map(|p| &self.steps[p.idx])
     }
 
     /// 失败视图里的血缘链。两个方向都算，顺序 = "为什么失败" 在前、
@@ -463,6 +510,8 @@ impl Lineage {
     ///
     /// - **反向**：这次调用的输入里，有哪个产物是**更早**某一步产出的？
     ///   `└─ input /tmp/x.pdf produced by step 3 fetch_pdf (ERRORED: 404)`
+    ///   只有"提到"证据时行文降级为 `first mentioned by step N` —— 一个先读过
+    ///   这个文件的 `Read` 不是它的产出者（2026-10-17 审计）。
     /// - **正向**：这次调用引用的产物，**后面**还有谁在用？
     ///   `└─ output /tmp/x.pdf referenced later by step 14 display_pdf`
     ///
@@ -476,14 +525,19 @@ impl Lineage {
 
         for a in &step.artifacts {
             let k = a.key();
-            if let Some(p) = self.producer_of(&k) {
-                if p.n < step.n {
+            if let Some(p) = self.producers.get(&k) {
+                let producer = &self.steps[p.idx];
+                if producer.n < step.n {
+                    // 有生产证据才说 "produced by"；只有"提到"时说 "first mentioned by"。
+                    // 这是两种不同强度的断言，屏幕上必须能分开读。
+                    let verb = if p.produced { "produced by" } else { "first mentioned by" };
                     back.push(format!(
-                        "\u{2514}\u{2500} input {} produced by step {} {} {}",
+                        "\u{2514}\u{2500} input {} {} step {} {} {}",
                         clip(&display_one(a), 52),
-                        p.n,
-                        p.tool,
-                        p.status.label()
+                        verb,
+                        producer.n,
+                        producer.tool,
+                        producer.status.label()
                     ));
                 }
             }
@@ -665,8 +719,86 @@ pub fn is_shell_tool(tool: &str) -> bool {
     let t = tool.to_ascii_lowercase();
     matches!(
         t.as_str(),
-        "bash" | "sh" | "shell" | "zsh" | "fish" | "exec" | "command" | "run" | "terminal"
+        "bash"
+            | "sh"
+            | "shell"
+            | "zsh"
+            | "fish"
+            | "exec"
+            | "command"
+            | "run"
+            | "terminal"
+            // DeepSeek Harness: `pwsh` on Windows, `bash` on Linux; the `.exe`
+            // forms appear in some harness builds. Without these the "I
+            // executed X" claim is silently unavailable for DSH sessions.
+            | "pwsh"
+            | "powershell"
+            | "pwsh.exe"
+            | "powershell.exe"
+            | "cmd"
+            | "cmd.exe"
     )
+}
+
+/// 工具本身就在写文件（Claude Code 的 Write/Edit）。这种调用是**写意图调用**，
+/// 参数里的产物在调用时刻就按"产出者"记 —— 即使结果还没到/失败了，也能说
+/// `produced by step N (ERRORED: …)`，那正是失败链要连起来的那句话。
+fn is_producer_tool(tool: &str) -> bool {
+    matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "write" | "edit" | "multiedit" | "notebookedit" | "write_file" | "edit_file"
+    )
+}
+
+/// 这次调用有没有写意图。
+///
+/// - `Write`/`Edit` 类工具：参数里的路径就是它要写的东西；
+/// - shell 命令：看 `bash_cmd` 里有没有输出重定向（`> f` / `>> f` / `>f`）或
+///   明确的输出文件参数（`curl/wget -o f`、`tee f`、`dd of=f`）。
+///
+/// **刻意保守**：`grep -o`（只输出匹配）不算写；只在参数里提到路径的调用
+/// （`Read`/`Grep`/`cat`）不算。判错的代价应该是"少说一句 produced by"，
+/// 而不是"把消费者说成生产者"（假一句）。
+fn tool_has_write_intent(tool: &str, bash_cmd: Option<&str>) -> bool {
+    if is_producer_tool(tool) {
+        return true;
+    }
+    if !is_shell_tool(tool) {
+        return false;
+    }
+    // 没有原始命令行就绝不猜：input_preview 是 JSON（description 里可能带 `>`）。
+    let Some(cmd) = bash_cmd else {
+        return false;
+    };
+    command_has_write_intent(cmd)
+}
+
+/// shell 命令里有没有"往文件写"的意图。见 [`tool_has_write_intent`] 的取舍。
+fn command_has_write_intent(cmd: &str) -> bool {
+    let (toks, _) = crate::exact::shlex_split(cmd);
+    let Some(first) = toks.first() else {
+        return false;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if base == "tee" {
+        return true;
+    }
+    if matches!(base, "curl" | "wget")
+        && toks
+            .iter()
+            .any(|t| matches!(t.as_str(), "-o" | "--output" | "-O"))
+    {
+        return true;
+    }
+    if base == "dd" && toks.iter().any(|t| t.starts_with("of=")) {
+        return true;
+    }
+    // 输出重定向：单独成 token 的 `>`/`>>`/`>|`，或紧贴路径的 `>/tmp/x`。
+    // `>&`（fd 复制 / `2>&1`）不是文件写，排除。
+    toks.iter().any(|t| {
+        (t == ">" || t == ">>" || t == ">|")
+            || (t.starts_with('>') && t.len() > 1 && !t.starts_with(">&"))
+    })
 }
 
 /// `tool.result` 文本 → 它声称做了什么。
@@ -801,21 +933,25 @@ fn http_status(text: &str) -> Option<u32> {
 // 对账：claim vs kernel
 // ---------------------------------------------------------------
 
-/// 这条调用在内核侧的事实。**全部来自已经被 join key 绑到这条调用上的行**
-/// （或由调用方明确的会话级绑定），不是"整个内核里搜了一遍"。
+/// 这条调用在内核侧的事实。**全部来自已经被 join key 绑到这条调用上的行**，
+/// 不是"整个内核里搜了一遍"。
+///
+/// 关键：事实集（`write_paths`/`net_targets`/`exec_seen`）只由 `fail.rs::on_kernel`
+/// 填充，而那里要求内核行带着这条调用的 `corr.tool_use_id`。所以 `linked == false`
+/// 意味着事实集**结构上为空** —— 它不是"内核里什么都没有"，只是"我们没连上"。
 #[derive(Debug, Default, Clone)]
 pub struct Facts<'a> {
     /// 这一轮有没有内核源（§13 的同一口径）。
     pub kernel_available: bool,
-    /// 这条调用挂上了 ≥1 条内核事件（argv 绑定成功）。
+    /// 这条调用挂上了 ≥1 条内核事件（argv 绑定成功）。**否定陈述的唯一依据。**
     pub linked: bool,
-    /// 会话级 pid 绑定是 exact 或 heuristic（楔形视图的第二个门槛）。
+    /// 会话级 pid 绑定是 exact 或 heuristic。**只用于解释/诊断**：它不填充事实集，
+    /// 所以永远不足以支撑"内核里没有 X"这句话（v0.6 的第二个门，已收紧）。
     pub session_linked: bool,
     /// 这条调用落在内核观测窗口**之内**（它的结果晚于第一条内核事件）。
     ///
-    /// 只对 `session_linked` 那条路有意义：会话级绑定说的是"这条调用的进程树
-    /// 我们看着"，但没看着的**那一小段**（采集器 attach 之前）里发生的事，
-    /// 我们不能拿"没看见"当"没发生"。绑到了内核事件的调用天然在窗口内。
+    /// **只用于解释/诊断**：窗口说明"我们当时在看这棵树"，但没连上的调用仍然
+    /// 没有可引用的事实。绑到了内核事件的调用天然在窗口内。
     pub in_window: bool,
     /// 这条调用子树里**写意图**的 open（路径，成功与否）。
     pub write_paths: &'a [String],
@@ -828,11 +964,39 @@ pub struct Facts<'a> {
 impl Facts<'_> {
     /// 有资格对**这条调用**做否定陈述吗。
     ///
-    /// 两个门槛缺一不可，与 §13 的楔形视图一致：
-    /// - 这一轮确实在看内核（否则"内核里没有"是一句没有主语的话）；
-    /// - 这条调用确实被连上了（有 join key 的内核事件，或会话级绑定可用）。
+    /// **只有 `linked` 够格。** 事实集只由 join-key 行填充（见 [`Facts`] 的注释），
+    /// 所以没连上的调用手上没有内核事实；`session_linked + in_window` 只说明
+    /// "这条调用在我们看着的进程树里"，不能把空的证据集变成"没发生"的证据。
+    /// v0.6 曾经把它当作第二个门，结果把诚实但没绑定上的调用（heredoc、
+    /// env 前缀改 argv、`Read` 这类根本不 exec 的工具）误报成 `!! claim-mismatch`。
     fn can_speak(&self) -> bool {
-        self.kernel_available && (self.linked || (self.session_linked && self.in_window))
+        self.kernel_available && self.linked
+    }
+
+    /// 没资格核对时的**明确原因**（给 `fail.rs` 的计数/诊断用）。`None` = 有资格。
+    ///
+    /// 分支刻意分开：脚本/用户要能分清"这一轮根本没看内核"、"看了但这条调用
+    /// 没连上"，以及"会话在看着、调用也在窗口内，但 join key 没连上"——最后一种
+    /// 最容易误读成"内核里没有"，它恰恰是最需要说明白的一类。
+    pub fn unverified_reason(&self) -> Option<&'static str> {
+        if !self.kernel_available {
+            return Some("no kernel source in this run, so there was nothing to check against");
+        }
+        if !self.linked {
+            if self.session_linked && self.in_window {
+                return Some(
+                    "the call is linked to the observed session and falls inside the kernel \
+                     observation window, but no kernel event carries its join key (argv binding \
+                     failed) — the kernel fact set is empty, and absence here is not evidence \
+                     about what happened",
+                );
+            }
+            return Some(
+                "no kernel event carries this call's join key (argv binding failed), so the kernel \
+                 fact set is empty — absence here is not evidence about what happened",
+            );
+        }
+        None
     }
 }
 
@@ -1312,6 +1476,9 @@ mod tests {
         assert!(claims(text).iter().any(|c| c.kind == ClaimKind::Exec));
         assert!(is_shell_tool("Bash") && is_shell_tool("shell"));
         assert!(!is_shell_tool("Read") && !is_shell_tool("WebFetch"));
+        // DeepSeek Harness 的 shell 工具名（Windows 上是 `pwsh`）。
+        assert!(is_shell_tool("pwsh") && is_shell_tool("powershell"));
+        assert!(is_shell_tool("cmd") && is_shell_tool("CMD.EXE"));
     }
 
     #[test]
@@ -1360,16 +1527,26 @@ mod tests {
         assert!(evaluate(&c, &f).is_empty());
     }
 
+    /// 会话级绑定**单独**不再够格（2026-10-17 审计）：事实集只由 join-key 行
+    /// 填充，没连上的调用手上是空集，拿它说"内核里没看见"就是把"我们没连上"
+    /// 说成"没发生"。窗口只影响**解释**，不影响资格。
     #[test]
-    fn the_second_door_needs_the_call_to_be_in_window() {
+    fn session_binding_alone_is_not_enough_for_a_negative_verdict() {
         let c = claims("Saved to /tmp/a.pdf");
         let mut f = facts(&[], &[], false);
         f.linked = false;
         f.session_linked = true;
         f.in_window = false; // 采集器 attach 之前的那一段
         assert!(evaluate(&c, &f).is_empty());
-        f.in_window = true;
+        assert!(f.unverified_reason().is_some());
+        f.in_window = true; // 即使落在观测窗口内，没连上仍然不许说话
+        assert!(evaluate(&c, &f).is_empty(), "second door must stay closed");
+        assert!(f.unverified_reason().is_some());
+
+        // 连上了（有 join key 的内核行）才轮到对账。
+        f.linked = true;
         assert_eq!(evaluate(&c, &f).len(), 1);
+        assert!(f.unverified_reason().is_none());
     }
 
     #[test]
@@ -1485,7 +1662,9 @@ mod tests {
         // (key, tool, args, ok, error note)
         let mut l = Lineage::new();
         for (i, (key, tool, args, ok, note)) in steps.iter().enumerate() {
-            let n = l.on_call(key, tool, args, (i as u64 + 1) * 1_000);
+            // shell 调用把 args 当命令行传：写意图（`> f`、`curl -o f`）要能看出来。
+            let bash_cmd = is_shell_tool(tool).then_some(*args);
+            let n = l.on_call(key, tool, args, bash_cmd, (i as u64 + 1) * 1_000);
             assert_eq!(n, i as u64 + 1);
             l.on_result(key, *ok, note.map(str::to_string), "");
         }
@@ -1528,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_mention_is_the_producer() {
+    fn repeats_keep_the_first_producing_step_as_the_producer() {
         // 循环重试：第 2、3 次提到同一个产物，产出者仍然是第 1 次。
         let cmd = "curl -o /tmp/a.pdf https://x/a.pdf";
         let l = lineage_with(&[
@@ -1542,6 +1721,85 @@ mod tests {
         assert_eq!(l.stats().reused, 2, "both the path and the URL repeat");
     }
 
+    /// 2026-10-17 审计：第一次提到产物的**消费者**不是产出者。
+    /// `grep /tmp/a.pdf` 只是读了它；只有写意图调用/成功的产出 claim 才算产出。
+    #[test]
+    fn a_consumer_mention_is_not_a_producer() {
+        let l = lineage_with(&[
+            ("c1", "Bash", "grep -n foo /tmp/a.pdf", true, None),
+            ("c2", "Read", "/tmp/a.pdf", false, Some("exit 1")),
+        ]);
+        let chain = l.chain("c2");
+        assert_eq!(chain.len(), 1, "{:?}", chain);
+        assert!(
+            chain[0].contains("first mentioned by step 1 Bash (ok)"),
+            "{:?}",
+            chain
+        );
+        assert!(!chain[0].contains("produced by"), "消费者被说成了产出者: {:?}", chain);
+    }
+
+    /// 反面：消费者先读到、真正的产出者在后面成功写下它 —— 产出者要**升级**
+    /// 成产出者，而不是永远停在第一次提到的那一步。
+    #[test]
+    fn a_later_successful_producer_upgrades_an_earlier_consumer_mention() {
+        let l = lineage_with(&[
+            ("c1", "Read", "/tmp/a.pdf", true, None),
+            ("c2", "Bash", "python3 gen.py > /tmp/a.pdf", true, None),
+            ("c3", "Read", "/tmp/a.pdf", false, Some("exit 1")),
+        ]);
+        let chain = l.chain("c3");
+        assert!(
+            chain.iter().any(|c| c.contains("produced by step 2 Bash (ok)")),
+            "写意图步骤没有升级成产出者: {:?}",
+            chain
+        );
+        assert!(
+            !chain.iter().any(|c| c.contains("produced by step 1")),
+            "消费者仍被当成产出者: {:?}",
+            chain
+        );
+    }
+
+    /// 失败结果里的"Error writing /tmp/x.pdf"**不是**生产证据：它可能什么都没写成。
+    /// 只有"提到"证据时行文必须是 `first mentioned by`。
+    #[test]
+    fn a_failed_result_claim_is_not_production_evidence() {
+        let mut l = Lineage::new();
+        l.on_call("c1", "Bash", "python3 gen.py", Some("python3 gen.py"), 1);
+        l.on_result(
+            "c1",
+            false,
+            Some("exit 1".into()),
+            "Error writing /tmp/x.pdf",
+        );
+        l.on_call("c2", "Read", "/tmp/x.pdf", None, 2);
+        l.on_result("c2", false, Some("exit 1".into()), "");
+        let chain = l.chain("c2");
+        assert_eq!(chain.len(), 1, "{:?}", chain);
+        assert!(
+            chain[0].contains("first mentioned by step 1 Bash (ERRORED: exit 1)"),
+            "{:?}",
+            chain
+        );
+        assert!(!chain[0].contains("produced by"), "{:?}", chain);
+    }
+
+    /// `Write`/`Edit` 类工具是写意图调用（结果还没到也算产出者）。
+    #[test]
+    fn a_write_tool_is_a_producer_even_before_its_result() {
+        let mut l = Lineage::new();
+        l.on_call("c1", "Write", "{\"file_path\":\"/tmp/out.pdf\"}", None, 1);
+        l.on_call("c2", "Read", "/tmp/out.pdf", None, 2);
+        let chain = l.chain("c2");
+        assert_eq!(chain.len(), 1, "{:?}", chain);
+        assert!(
+            chain[0].contains("produced by step 1 Write (no result yet)"),
+            "{:?}",
+            chain
+        );
+    }
+
     #[test]
     fn a_claim_comes_from_the_result_text_not_from_the_call_args() {
         // claim 的语义是"**这条结果**说它做了 X"，不是"这条调用的参数里有 X"。
@@ -1553,9 +1811,15 @@ mod tests {
         // 读者能自己判读。反过来把 claim 限制在参数里，绝大多数真实的
         // "脚本自己决定输出路径"就永远查不着。
         let mut l = Lineage::new();
-        l.on_call("c1", "Bash", "curl -o /tmp/a.pdf https://x/a.pdf", 1);
+        l.on_call(
+            "c1",
+            "Bash",
+            "curl -o /tmp/a.pdf https://x/a.pdf",
+            Some("curl -o /tmp/a.pdf https://x/a.pdf"),
+            1,
+        );
         l.on_result("c1", true, None, "Saved to /tmp/a.pdf");
-        l.on_call("c2", "Read", "/tmp/a.pdf", 2);
+        l.on_call("c2", "Read", "/tmp/a.pdf", None, 2);
         l.on_result("c2", true, None, "the file says: saved /tmp/other.pdf");
         assert_eq!(l.claims_of("c1").len(), 1);
         let c2 = l.claims_of("c2");

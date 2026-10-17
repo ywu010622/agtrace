@@ -282,6 +282,11 @@ impl SourceFilter {
     }
 
     /// 该 kind 是否被 --source 允许输出（Rust 侧的兜底过滤，双保险）。
+    ///
+    /// 这里必须把 **agent 层**也显式映射到 `--source agent`：`_ => true` 曾把每个
+    /// agent kind 都当成"总是允许"，于是 `--source exec` 的运行仍然打印模型/工具行
+    /// （而表头只列 exec）。派生行只描述已经放行的事件，采集器自身的丢包/结束行
+    /// 无论选择哪些源都必须可见（§4.3 不静默），它们保持 true。
     pub fn allows(&self, k: Kind) -> bool {
         match k {
             Kind::RuntimeProcFork | Kind::RuntimeProcExec | Kind::RuntimeProcExecFail | Kind::RuntimeProcExit => {
@@ -289,6 +294,20 @@ impl SourceFilter {
             }
             Kind::InfraFileOpen => self.file,
             Kind::InfraNetConnect | Kind::InfraNetSendto => self.net,
+            Kind::AgentPrompt
+            | Kind::AgentPromptQueued
+            | Kind::AgentModelRequest
+            | Kind::AgentModelThinking
+            | Kind::AgentModelText
+            | Kind::AgentModelUsage
+            | Kind::AgentToolCall
+            | Kind::AgentToolResult
+            | Kind::AgentSandboxDisabled
+            | Kind::PolicyDenyAgent => self.agent,
+            // Loss/end rows the collector itself produces: always visible.
+            Kind::CollectorLostEvents => true,
+            // Derived rows are summaries/claims about events that already passed the
+            // filter above; they are not a source of their own.
             _ => true,
         }
     }
@@ -548,6 +567,41 @@ mod tests {
         assert!(SourceFilter::parse("").is_err());
     }
 
+    /// `--source` 是四个维度共用的过滤器；agent 层必须被**显式**映射，否则
+    /// `--source exec` 下 agent 行照常出现、而表头只列 exec。
+    #[test]
+    fn source_filter_covers_the_agent_layer_explicitly() {
+        let f = SourceFilter::parse("exec").unwrap();
+        assert!(f.allows(Kind::RuntimeProcExec));
+        assert!(!f.allows(Kind::InfraFileOpen));
+        assert!(!f.allows(Kind::AgentToolCall));
+        assert!(!f.allows(Kind::AgentPrompt));
+        assert!(!f.allows(Kind::PolicyDenyAgent));
+        // 采集器自身的丢包/结束行无论选择哪些源都必须可见（§4.3 不静默）。
+        assert!(f.allows(Kind::CollectorLostEvents));
+
+        let a = SourceFilter::parse("agent").unwrap();
+        assert!(a.allows(Kind::AgentModelText));
+        assert!(!a.allows(Kind::RuntimeProcExec));
+        assert!(a.allows(Kind::CollectorLostEvents));
+    }
+
+    /// `/sys/fs/cgroup` 是不是**统一的 v2 根**（kernfs，cgroup id 恒为 1）。
+    ///
+    /// WSL2 的混合 cgroup 布局里 `/sys/fs/cgroup` 是 tmpfs（v2 挂在
+    /// `/sys/fs/cgroup/unified`），`name_to_handle_at` 会返回 inode 句柄而不是
+    /// kernfs 根 id —— 在那里断言 id==1 是在测文件系统布局，不是在测代码。
+    #[cfg(target_os = "linux")]
+    fn is_cgroup2_root(path: &str) -> bool {
+        let Ok(c) = std::ffi::CString::new(path) else {
+            return false;
+        };
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // CGROUP2_SUPER_MAGIC = 0x63677270
+        let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
+        rc == 0 && st.f_type == 0x6367_7270
+    }
+
     #[test]
     fn the_root_cgroup_resolves_to_one() {
         // `-C` 的唯一一个不需要预先准备就能问的 cgroup，也正是上面文档里承诺过的
@@ -558,6 +612,14 @@ mod tests {
         // 不是只在某台机器的某个 cgroup 上失败，这正是它当初没被发现的原因。
         if !std::path::Path::new("/sys/fs/cgroup").exists() {
             return; // cgroup v1 主机：没有统一层级，跳过
+        }
+        #[cfg(target_os = "linux")]
+        if !is_cgroup2_root("/sys/fs/cgroup") {
+            eprintln!(
+                "skipping the_root_cgroup_resolves_to_one: /sys/fs/cgroup is not a cgroup2 mount \
+                 (WSL hybrid layout) — kernel cgroup ids are not kernfs ids here"
+            );
+            return;
         }
         match cgroup_path_to_id("/sys/fs/cgroup") {
             Ok(id) => assert_eq!(id, 1),

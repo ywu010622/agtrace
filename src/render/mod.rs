@@ -736,14 +736,89 @@ pub fn truncate_display(s: &str, max_cols: usize) -> (String, bool) {
 /// 折行会破坏 strace 式定宽列，让纵向扫读失效。
 pub const MAX_COLS: usize = 120;
 
+/// 一个 ANSI CSI 序列（`ESC [ … final`）的字节长度；不是完整序列时返回 `None`。
+///
+/// `cap_cols` 可能拿到**已经着色的**串（`text.rs` 的 summary 是先 `colorize`、
+/// 再统一限宽的）。ANSI 转义不是可见列：把它按字符数算进去，带颜色的那一版就会比
+/// `--no-color` 提前 8–9 列被砍，同一条命令在两种模式下显示成不同长度 —— 这正是
+/// §3 要避免的不一致。识别失败时返回 `None`，交给普通字符路径：宁可少算一个转义，
+/// 也不吞掉真实内容。
+fn ansi_csi_len(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&0x1b) || bytes.get(i + 1) != Some(&b'[') {
+        return None;
+    }
+    let mut j = i + 2;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if (0x40..=0x7e).contains(&b) {
+            // final byte：序列到此结束。
+            return Some(j + 1 - i);
+        }
+        // 参数字节 0x30..=0x3f / 中间字节 0x20..=0x2f：继续扫描。
+        if !(0x20..=0x3f).contains(&b) {
+            return None;
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 可见显示宽度：与 [`display_width`] 相同，但 ANSI CSI 序列按 0 列计算。
+fn display_width_visible(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut w = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        if let Some(n) = ansi_csi_len(bytes, i) {
+            i += n;
+            continue;
+        }
+        let c = s[i..].chars().next().expect("char boundary");
+        w += char_width(c);
+        i += c.len_utf8();
+    }
+    w
+}
+
 /// 把**一行**按 MAX_COLS 截断（超宽时补 `~`）。用于横幅、注记与统计行 ——
 /// 上限只对时间线成立、对错误信息不成立的话，用户还是会被折行烦到。
+///
+/// 宽度按**可见列**算（ANSI 转义 0 列）。截断时：ANSI 序列整段复制，绝不切开；
+/// 若被砍的行带着颜色，在 `~` 之后补一个 RESET，免得颜色泄漏到后续输出。
 pub fn cap_cols(s: &str) -> String {
-    if display_width(s) <= MAX_COLS {
+    if display_width_visible(s) <= MAX_COLS {
         return s.to_string();
     }
-    let (cut, _) = truncate_display(s, MAX_COLS - 1);
-    format!("{}~", cut)
+    // 预留 1 列给行尾的 `~`。
+    let budget = MAX_COLS - 1;
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut w = 0usize;
+    let mut i = 0usize;
+    let mut saw_ansi = false;
+    while i < s.len() {
+        if let Some(n) = ansi_csi_len(bytes, i) {
+            out.push_str(&s[i..i + n]);
+            saw_ansi = true;
+            i += n;
+            continue;
+        }
+        let c = s[i..].chars().next().expect("char boundary");
+        let cw = char_width(c);
+        if w + cw > budget {
+            out.push('~');
+            if saw_ansi {
+                out.push_str(RESET);
+            }
+            return out;
+        }
+        out.push(c);
+        w += cw;
+        i += c.len_utf8();
+    }
+    // 只有可见宽度 > MAX_COLS 才会走到这里，而那样必然在上面的判断里截断；
+    // 留一条不补 `~` 的防御性出口，不制造假截断标记。
+    out
 }
 
 /// 逐行套用 cap_cols（横幅与统计行都是多行字符串）。

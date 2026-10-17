@@ -68,6 +68,12 @@ pub struct ViewsConfig {
     pub enable_gap: bool,
     pub enable_retry: bool,
     pub enable_watch: bool,
+    /// 收尾时是否报告悬空调用（`derived.tool.dangling`）。
+    ///
+    /// `--no-views` 必须把它关掉：`disabled()` 之前只把 `dangling_min_ms` 设成
+    /// `u64::MAX`，而 `finish()` 根本没读那个字段 —— 于是 `--no-views` 仍会冒出
+    /// 派生行（2026-10-17 审计）。
+    pub enable_dangling: bool,
     /// tool call → result 超过这个间隔就报告（默认 5s）。
     pub gap_ms: u64,
     /// 同一 (tool, input) 在这个窗口内再次出现才算"重试"（默认 60s）。
@@ -89,6 +95,7 @@ impl Default for ViewsConfig {
             enable_gap: true,
             enable_retry: true,
             enable_watch: true,
+            enable_dangling: true,
             gap_ms: 5_000,
             retry_window_ms: 60_000,
             dangling_min_ms: 3_000,
@@ -244,6 +251,10 @@ pub struct Views {
     wedge_skipped_precollection: u64,
     /// 本轮 observe 产生的派生事件。
     derived: Vec<Event>,
+    /// 观察到的**最后一个**事件的 ts（单调钟）—— 收尾时用它算"这条 pending
+    /// 调用已经等了多久"，`dangling_min_ms` 的判据（2026-10-17 审计：
+    /// 之前这个字段的配置读进来了却没人用）。
+    last_event_ts: u64,
     pub gap_count: u64,
     pub retry_count: u64,
     pub watch_count: u64,
@@ -265,6 +276,7 @@ impl Views {
             kernel_first_ts: None,
             wedge_skipped_precollection: 0,
             derived: Vec::new(),
+            last_event_ts: 0,
             gap_count: 0,
             retry_count: 0,
             watch_count: 0,
@@ -275,12 +287,16 @@ impl Views {
 
     /// 全部关闭。用于 `--no-views`：用户只想要原始时间线时，派生行是噪声。
     /// 单元测试也用它，保证 merger 的排序测试不被派生事件干扰。
+    ///
+    /// 2026-10-17：`finish()` 现在真的检查 `enable_dangling`（旧实现只看
+    /// `dangling_min_ms` 且根本没读它，`--no-views` 会漏出 dangling 行）。
     pub fn disabled() -> Self {
         Views::new(ViewsConfig {
             kernel_available: false,
             enable_gap: false,
             enable_retry: false,
             enable_watch: false,
+            enable_dangling: false,
             gap_ms: u64::MAX,
             retry_window_ms: 0,
             dangling_min_ms: u64::MAX,
@@ -364,6 +380,7 @@ impl Views {
     }
 
     pub fn observe(&mut self, ev: &mut Event) {
+        self.last_event_ts = self.last_event_ts.max(ev.ts_ns);
         if ev.from_kernel_collector() {
             self.kernel_events_seen += 1;
             // 内核观测窗口的左边界 = 第一条内核事件。注意事件是**乱序**进入
@@ -476,15 +493,23 @@ impl Views {
                 .position(|p| p.corr.tool_use_id.as_deref() == Some(id)),
             None => {
                 // 有 id 的 result 不该抢无 id 的槽位，反之亦然：按 tool 名匹配最早的。
+                // 只配对**同工具**（或 result 没带工具名）的调用：工具名对不上时
+                // 退到"最早的那条"会把一条 Bash 结果配给一个 Read 调用，既假造了
+                // gap、又掩盖了真正的 dangling（2026-10-17 审计）。
                 let tool = match &ev.payload {
-                    Payload::ToolResult { tool, .. } => tool.clone(),
+                    Payload::ToolResult { tool, .. } => tool.as_deref(),
                     _ => None,
                 };
-                let want = tool.clone().unwrap_or_default();
-                self.pending
-                    .iter()
-                    .position(|p| tool.is_none() || p.tool == want)
-                    .or(if self.pending.is_empty() { None } else { Some(0) })
+                match tool {
+                    Some(want) => self.pending.iter().position(|p| p.tool == want),
+                    None => {
+                        if self.pending.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        }
+                    }
+                }
             }
         };
         let Some(i) = idx else { return };
@@ -650,13 +675,20 @@ impl Views {
     pub fn finish(&mut self) -> Vec<Event> {
         let mut out = std::mem::take(&mut self.derived);
         let pending = std::mem::take(&mut self.pending);
+        // 流的结尾 = 观察到的最后一个事件。用它的 ts 算 call 已经等了多久：
+        // 不再用"只要还在 pending 就是悬空"（那会把流的最后一条调用误报，而且
+        // 让 `dangling_min_ms` 成为死配置）。
+        let stream_end = self.last_event_ts;
+        let min_ns = self.cfg.dangling_min_ms.saturating_mul(1_000_000);
         for p in pending {
-            // 用"最后一个事件的时间"没法拿到，用 pending 自己的 ts 无从判断过了多久；
-            // 这里只用调用方设定的下限做保守判断：只要它还在 pending 里，
-            // 就说明整个流都没等到 result —— 这正是悬空。
-            // `dangling_min_ms` 用来过滤"流末尾刚开始的调用"：那属于扫描窗口问题，
-            // 不是 agent 卡住，所以只有当它比流内最后事件早足够久才报。
-            let _ = self.cfg.dangling_min_ms;
+            if !self.cfg.enable_dangling {
+                continue;
+            }
+            let waited_ns = stream_end.saturating_sub(p.ts_ns);
+            if waited_ns < min_ns {
+                // 流末尾刚开始的调用属于扫描窗口问题，不是 agent 卡住。
+                continue;
+            }
             self.dangling_count += 1;
             let mut e = Event {
                 seq: 0,
@@ -1075,14 +1107,83 @@ mod tests {
         assert!(!b.retry, "超出窗口的重复不该算重试");
     }
 
+    /// 流尾那条"正在进行中"的调用**不该**被报成悬空：`dangling_min_ms`
+    /// （默认 3s）现在真的生效了（2026-10-17 审计前是 `let _ = ...`）。
+    #[test]
+    fn dangling_at_stream_end_is_filtered_by_the_threshold() {
+        let mut v = Views::new(ViewsConfig::default());
+        let mut c = call(0, "t1", "Bash", Some("sleep 9"));
+        v.observe(&mut c);
+        // 流结束只比调用晚 100ms —— 扫描窗口问题，不是 agent 卡住。
+        let mut later = call(100_000_000, "t2", "Read", Some("y"));
+        v.observe(&mut later);
+        let f = v.finish();
+        assert!(
+            f.iter().all(|e| e.kind != Kind::DerivedToolDangling),
+            "流末尾刚开始的调用被误报成悬空: {:?}",
+            f
+        );
+        assert_eq!(v.dangling_count, 0);
+    }
+
     #[test]
     fn dangling_reported_at_finish() {
         let mut v = Views::new(ViewsConfig::default());
-        let mut c = call(0, "t1", "Bash", None);
+        let mut c = call(0, "t1", "Bash", Some("sleep 9"));
         v.observe(&mut c);
+        // 流又跑了 10s 才结束：这条调用确实一直没等到 result。
+        let mut later = call(10 * S, "t2", "Read", Some("y"));
+        v.observe(&mut later);
         let f = v.finish();
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].kind, Kind::DerivedToolDangling);
+        let rows: Vec<&Event> = f.iter().filter(|e| e.kind == Kind::DerivedToolDangling).collect();
+        assert_eq!(rows.len(), 1, "只有等了 10s 的那条才算悬空: {:?}", f);
+        assert_eq!(v.dangling_count, 1);
+    }
+
+    /// `--no-views`（`Views::disabled()`）在收尾时**一行派生都不能产出**：
+    /// 旧实现只把 `dangling_min_ms` 设成 `u64::MAX`，而 `finish()` 没读它。
+    #[test]
+    fn disabled_views_produce_nothing_at_finish() {
+        let mut v = Views::disabled();
+        let mut c = call(0, "t1", "Bash", Some("sleep 9"));
+        v.observe(&mut c);
+        let mut later = call(10 * S, "t2", "Read", Some("y"));
+        v.observe(&mut later);
+        assert!(v.finish().is_empty(), "disabled views leaked a derived row");
+        assert_eq!(v.dangling_count, 0);
+    }
+
+    /// 工具名对不上任何 pending 的结果**不能**退到"最早的那条"：那会把一条
+    /// Bash 结果配给一个 Read 调用（假造 gap、掩盖真正的 dangling）。
+    #[test]
+    fn a_result_of_a_different_tool_is_not_paired_with_the_oldest_pending() {
+        let mut v = Views::new(ViewsConfig::default());
+        let mut c = call(0, "t1", "Read", None);
+        c.corr.tool_use_id = None;
+        v.observe(&mut c);
+
+        let mut r = result(5 * S, "t2", "Bash", "success");
+        r.corr.tool_use_id = None;
+        v.observe(&mut r);
+        assert!(
+            v.drain_derived().is_empty(),
+            "wrong-tool pairing fabricated a gap/retry row"
+        );
+
+        let tail = v.finish();
+        assert_eq!(v.dangling_count, 1, "Read 调用仍应悬空");
+        assert!(tail.iter().any(|e| e.kind == Kind::DerivedToolDangling));
+
+        // 同工具、都没有 id 时 FIFO 配对必须照旧工作。
+        let mut v = Views::new(ViewsConfig::default());
+        let mut c = call(0, "t1", "Read", None);
+        c.corr.tool_use_id = None;
+        v.observe(&mut c);
+        let mut r = result(1 * S, "t2", "Read", "success");
+        r.corr.tool_use_id = None;
+        v.observe(&mut r);
+        assert_eq!(v.finish().len(), 0, "同工具的无 id 结果没配上");
+        assert_eq!(v.dangling_count, 0);
     }
 
     /// §10.3 楔形：Bash 说成功，但窗口内没有任何内核 connect。

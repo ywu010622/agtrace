@@ -108,13 +108,15 @@ pub struct FailCfg {
     /// 内核事件都已放出"，所以水位线越过 `结果 ts + 这个值` 之后，再说"内核里
     /// 没有这条调用的足迹"才不是抢答。见文件头的"什么时候下结论"。
     pub settle_ns: u64,
-    /// v0.6 §14.2 的第二个门槛：会话级 pid 绑定是不是 exact/heuristic。
+    /// 会话级 pid 绑定是不是 exact/heuristic —— **只用于解释，不再是核对门槛**。
     ///
-    /// 有些调用挂不上任何内核事件（binder 没匹配上），但它仍然落在我们看着的
-    /// 那棵进程树里。这种时候"内核里没有这次写入"这句话是**成立的** ——
-    /// 前提是我们真的看着它（本字段），而且它在我们看着的时间段里（见
-    /// [`lineage::Facts::in_window`]）。没有这一位，claim 核对在 `-p` 模式下
-    /// 会退化成只认 argv 绑定成功的调用。
+    /// v0.6 曾把它当第二个门：调用没被 argv 绑定时，只要它落在我们看着的进程树里
+    /// 就说"内核里没有这次写入"。**这是错的**（2026-10-17 审计）：事实集
+    /// （`Evidence::kb`）只由带 join key 的内核行填充，没绑定的调用手上是空集，
+    /// 于是这句话实际是"我们没连上"，不是"它没发生"。`Read` 这类根本不 exec 的
+    /// 工具、heredoc / env 前缀这类 binder 合法漏配的命令都会因此被误报成
+    /// `!! claim-mismatch`。现在它只用于把"没内核源"和"看了但没连上"分开计数
+    /// （见 [`FailAttributor::claims_unverified_unlinked`]）。
     pub pid_linked: bool,
 }
 
@@ -351,6 +353,15 @@ pub struct FailAttributor {
     pub claims_seen: u64,
     pub claims_checked: u64,
     pub claims_unverified: u64,
+    /// 其中"在看内核、但这条调用没有 join key"的条数（与 `no kernel source`
+    /// 分开计数：前者是 join key 的缺口，后者是压根没看）。
+    pub claims_unverified_unlinked: u64,
+    /// 最近一次"没资格核对"的**明确原因**（`-v` / JSON 可查；见
+    /// [`lineage::Facts::unverified_reason`]）。
+    pub claims_unverified_reason: Option<&'static str>,
+    /// 找不到归属的 `tool.result` 数（显式 id 已 resolved/未知，或没有 id 且没有
+    /// 可配对的同工具调用）。以前这类结果会被 FIFO 猜给别的调用，现在是计数。
+    pub unmatched_results: u64,
     pub claims_mismatched: u64,
 }
 
@@ -374,6 +385,9 @@ impl FailAttributor {
             claims_seen: 0,
             claims_checked: 0,
             claims_unverified: 0,
+            claims_unverified_unlinked: 0,
+            claims_unverified_reason: None,
+            unmatched_results: 0,
             claims_mismatched: 0,
         }
     }
@@ -577,15 +591,36 @@ impl FailAttributor {
         let facts = self.facts_for(&p.key, &p.call, &evidence);
         let claims = self.lineage.claims_of(&p.key);
         self.claims_seen += claims.len() as u64;
-        let rows = lineage::evaluate(&claims, &facts);
-        if rows.is_empty() {
-            // 门槛没过：有 claim 但我们没资格核对。
+        // 门槛先于对账：**明确记下"为什么没核对"**。没连上的调用手上没有内核事实
+        // （`Evidence::kb` 只由 join-key 行填充），它的"没看见"不构成任何结论；
+        // 会话级绑定单独不够格（见 `lineage::Facts::can_speak`）。
+        if let Some(reason) = facts.unverified_reason() {
             if !claims.is_empty() {
                 self.claims_unverified += claims.len() as u64;
+                if self.cfg.kernel_available {
+                    // 和"这一轮压根没看内核"分开计数：这是 join key 的缺口。
+                    self.claims_unverified_unlinked += claims.len() as u64;
+                }
             }
             self.calls.remove(&p.key);
             if self.cfg.only {
                 // `--failures-only`：这条链没有任何结论，整条丢掉。
+                self.chains.remove(&p.key);
+            }
+            // 审计信息：原因必须在 `-v`/JSON 里查得到（main.rs 的 summary 段）。
+            self.claims_unverified_reason = Some(reason);
+            return;
+        }
+        let rows = lineage::evaluate(&claims, &facts);
+        debug_assert!(
+            claims.is_empty() || !rows.is_empty(),
+            "can_speak() passed but evaluate() produced no rows (claims={})",
+            claims.len()
+        );
+        if rows.is_empty() {
+            // 没有 claim：无事可对。
+            self.calls.remove(&p.key);
+            if self.cfg.only {
                 self.chains.remove(&p.key);
             }
             return;
@@ -762,14 +797,13 @@ impl FailAttributor {
 
     /// 这条事件属于哪条**未定论**的调用链。
     ///
-    /// 首选 `corr.tool_use_id`（binder 盖的 join key）；没有时，`tool.result` 退到
-    /// "同工具、最早未定论"的 FIFO 配对 —— 有些 adapter（openshell fixture）不带 id，
-    /// 但它们的故事一样要讲得通。
+    /// 首选 `corr.tool_use_id`（binder 盖的 join key）；**显式 id 只做精确查表**，
+    /// 查不到就是查不到 —— 绝不退到 FIFO 猜配（2026-10-17 审计：迟到的重复结果
+    /// 会把另一条同工具调用坐实，XX 行里拼进别人的 cmd）。没有 id 的 adapter
+    /// （openshell fixture / 不带 id 的 jsonl）才走"同工具、最早未定论"的 FIFO。
     fn key_for_event(&self, ev: &Event) -> Option<String> {
         if let Some(id) = ev.corr.tool_use_id.as_deref() {
-            if self.live(id) {
-                return Some(id.to_string());
-            }
+            return self.live(id).then(|| id.to_string());
         }
         if ev.kind != Kind::AgentToolResult {
             return None;
@@ -825,15 +859,20 @@ impl FailAttributor {
         // 因为"第 12 步引用了第 3 步的产物"里的第 3 步，往往是一次成功的调用。
         // 命令行与输入预览都要喂进去：产物既可能写在 `Bash` 的 cmd 里，
         // 也可能写在 `Read` 的 input 里（`{"file_path": "/tmp/report.pdf"}`）。
-        let args = match &ev.payload {
+        // `bash_cmd` 单独传：血缘靠它判断这次调用有没有**写意图**（`> file`、
+        // `curl -o file`），从而区分"产出者"与"只是提到过这个路径的消费者"。
+        let (args, bash_cmd) = match &ev.payload {
             Payload::ToolCall {
                 input_preview,
                 bash_cmd,
                 ..
-            } => format!("{} {}", input_preview, bash_cmd.as_deref().unwrap_or("")),
-            _ => cmd.to_string(),
+            } => (
+                format!("{} {}", input_preview, bash_cmd.as_deref().unwrap_or("")),
+                bash_cmd.as_deref(),
+            ),
+            _ => (cmd.to_string(), None),
         };
-        let step = self.lineage.on_call(&key, tool, &args, ev.ts_wall_ns);
+        let step = self.lineage.on_call(&key, tool, &args, bash_cmd, ev.ts_wall_ns);
         self.calls.insert(
             key.clone(),
             Call {
@@ -935,6 +974,10 @@ impl FailAttributor {
 
     fn on_result(&mut self, ev: &Event, tool: Option<&str>, status: &str, text: &str) -> Resolution {
         let Some(key) = self.key_for_result(ev, tool) else {
+            // 查不到归属的结果**必须计数**（DESIGN：不许静默丢失）。显式 id 查不到
+            // 时尤其不能退到 FIFO：那会把这条结果的 corr 和另一条调用的 cmd 拼进
+            // 同一条 XX 行 —— 一个比"没结论"更糟的结论。
+            self.unmatched_results += 1;
             return Resolution::None;
         };
         let (verdict, detected_by) = judge(status, text);
@@ -983,12 +1026,13 @@ impl FailAttributor {
         Resolution::Failed
     }
 
-    /// 给结果找调用。带 id 的直接查表；不带的按 FIFO 同工具配对（见 `key_for_event`）。
+    /// 给结果找调用。带 id 的只做精确查表；不带的按 FIFO 同工具配对（见 `key_for_event`）。
+    ///
+    /// 显式 id 查不到（已 resolved / 调用行丢失 / 未知 id）时返回 `None`，由调用方
+    /// 记入 `unmatched_results` —— 以前的"退到 FIFO"会把结果配给另一条同工具调用。
     fn key_for_result(&self, ev: &Event, tool: Option<&str>) -> Option<String> {
         if let Some(id) = ev.corr.tool_use_id.as_deref() {
-            if self.calls.get(id).is_some_and(|c| !c.resolved) {
-                return Some(id.to_string());
-            }
+            return self.calls.get(id).filter(|c| !c.resolved).map(|_| id.to_string());
         }
         self.order
             .iter()
@@ -1122,22 +1166,28 @@ fn text_failure(text: &str) -> Option<String> {
     None
 }
 
-/// `Exit code 1` / `Exit code: 127` → 1 / 127。
+/// `Exit code 1` / `Exit code: 127` / `[exit code: 2]` → 1 / 127 / 2。
 ///
-/// 只认大写 `E` + 空格/冒号的**字面协议**，因为这是 harness 的错误前缀。
+/// 只认 `exit code` + 可选冒号 + 数字的**字面协议**（大小写不敏感：DSH 的
+/// shell 工具用全小写的 `[exit code: N]`，Claude Code 用 `Error: Exit code N`）。
 /// 命令自己的输出（`exit=7`、`exit(2)`）**绝不能**被吃进来 —— 那会把一个成功的
 /// `curl ... ; echo "exit=$?"` 读成失败（实测：那一行的结果正是 `stdout: exit=7`）。
 pub fn exit_code_from_text(text: &str) -> Option<i64> {
-    let mut rest = text;
-    while let Some(i) = rest.find("Exit code") {
-        let after = &rest[i + "Exit code".len()..];
+    // `to_ascii_lowercase` 保持字节布局不变（ASCII 大小写映射等长，非 ASCII
+    // 字节原样保留），所以下面的字节下标可以同时安全地切原文。
+    let lower = text.to_ascii_lowercase();
+    let needle = "exit code";
+    let mut from = 0usize;
+    while let Some(i) = lower[from..].find(needle) {
+        let idx = from + i;
+        let after = &text[idx + needle.len()..];
         let after = after.trim_start();
         let after = after.strip_prefix(':').unwrap_or(after).trim_start();
         let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
         if !digits.is_empty() {
             return digits.parse::<i64>().ok();
         }
-        rest = after;
+        from = idx + needle.len();
     }
     None
 }
@@ -1763,11 +1813,13 @@ mod tests {
         assert!(facts.in_window);
     }
 
-    /// 上一条的**后果**回归：修复前 `in_window` 恒假，于是"会话级 pid 绑定 +
-    /// 没挂上内核事件"这条路永远走不通 —— claim 核对被静默跳过，矛盾被记成
-    /// `claims_unverified`（没资格核对）而不是 `claims_mismatched`。
+    /// 上一条的**诚实边界**（2026-10-17 审计后收紧）：调用落在观测窗口内、会话级
+    /// pid 绑定也成立，但它**没有 join key** —— 这时事实集为空，不能说"内核里没有"。
+    /// v0.6 的第二个门曾把这种调用报成 `!! claim-mismatch`（把 `Read` 结果里的
+    /// "Saved to …"、heredoc 里没绑上的真写真写成"agent 撒谎"）。现在必须只记
+    /// `claims_unverified`，并单独记录"看了内核但没连上"这一类。
     #[test]
-    fn an_unlinked_call_in_the_window_is_still_eligible_for_claim_checking() {
+    fn an_unlinked_call_in_the_window_is_unverified_not_mismatched() {
         let cfg = FailCfg {
             only: false,
             kernel_available: true,
@@ -1775,7 +1827,7 @@ mod tests {
             pid_linked: true,
         };
         let mut a = FailAttributor::new(cfg);
-        a.process(vec![
+        let out = a.process(vec![
             // 窗口左沿：属于别的调用，不挂在 t1 上。
             exec_ok(S, "t9", 99, "/usr/bin/true"),
             // t1 在窗口内发起；它说自己写了盘，内核侧却一条事件都没有。
@@ -1788,18 +1840,25 @@ mod tests {
                 "stdout: Saved to /tmp/v06demo2/work/gone.pdf",
             ),
         ]);
-        a.finish();
-
-        assert_eq!(
-            a.claims_unverified, 0,
-            "窗口内的调用被判成没资格核对 —— claim 核对又被跳过了"
-        );
-        assert_eq!(a.claims_mismatched, 1, "内核没看见落盘，对账却没跑起来");
-        assert_eq!(a.failures.len(), 1);
+        let tail = a.finish();
+        let all: Vec<&Event> = out.iter().chain(tail.iter()).collect();
         assert!(
-            a.failures[0].head.contains("no write open observed"),
-            "{}",
-            a.failures[0].head
+            all.iter().all(|e| e.kind != Kind::DerivedFail && e.kind != Kind::DerivedClaim),
+            "没 join key 的调用不许产出 claim 对账行: {:?}",
+            all.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(a.claims_mismatched, 0, "没连上却说了'内核里没有'");
+        assert!(a.failures.is_empty());
+        assert_eq!(a.claims_unverified, 1);
+        assert_eq!(
+            a.claims_unverified_unlinked, 1,
+            "必须和'压根没看内核'分开计数"
+        );
+        assert!(
+            a.claims_unverified_reason
+                .is_some_and(|r| r.contains("join key")),
+            "没资格核对时必须留下明确原因: {:?}",
+            a.claims_unverified_reason
         );
     }
 
@@ -1992,6 +2051,29 @@ mod tests {
         assert!(f[0].tool_use_id.is_none());
     }
 
+    /// 显式 id 的结果**只做精确查表**：重复/迟到/未知 id 不许退到 FIFO，把另一条
+    /// 同工具调用坐实（XX 行里会拼进别人的 cmd 和 corr）。2026-10-17 审计修复。
+    #[test]
+    fn late_duplicate_result_never_resolves_another_call() {
+        let mut a = FailAttributor::new(kernel_on());
+        let out = a.process(vec![
+            call(1 * S, "c1", "Bash", "echo one"),
+            result(2 * S, "c1", "Bash", "Success", "stdout: one"),
+            call(3 * S, "c2", "Bash", "echo two"),
+            // c1 已经 resolved，这条**同一个 id** 的重复结果以前会配给 c2。
+            result(4 * S, "c1", "Bash", "Failure", "Error: Exit code 1"),
+        ]);
+        let tail = a.finish();
+        let all: Vec<&Event> = out.iter().chain(tail.iter()).collect();
+        assert!(
+            all.iter().all(|e| e.kind != Kind::DerivedFail),
+            "重复结果被配给了另一条调用: {:?}",
+            all.iter().map(|e| e.kind).collect::<Vec<_>>()
+        );
+        assert!(a.failures.is_empty());
+        assert_eq!(a.unmatched_results, 1, "查不到归属的结果必须计数");
+    }
+
     /// **实测回归**（一次 `claude -p` 抓包，§13.5）：`tool.result` 先到，
     /// 它解释的 `execve` + `openat ENOENT` 后到。
     ///
@@ -2085,6 +2167,13 @@ mod tests {
         assert_eq!(exit_code_from_text("stdout: exit=7"), None);
         assert_eq!(exit_code_from_text("exit(0)"), None);
         assert_eq!(exit_code_from_text("Exit code 0"), Some(0));
+        // DeepSeek Harness shell tools append the marker in lower case:
+        // `...output...\n[exit code: 2]`.
+        assert_eq!(exit_code_from_text("no such file\n[exit code: 2]"), Some(2));
+        assert_eq!(exit_code_from_text("[exit code: 0]"), Some(0));
+        assert_eq!(exit_code_from_text("note: exit code: 130"), Some(130));
+        // Still not a shell literal.
+        assert_eq!(exit_code_from_text("exit_code=5"), None);
     }
 
     #[test]

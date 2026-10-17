@@ -1,6 +1,6 @@
 [package]
 name = "agtrace"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["Yuhang Wu"]
 license = "MIT"
@@ -24,6 +24,10 @@ libc = "0.2.190"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"
 toml = "1.1.8"
+# DSH session logs are concatenated Zstandard frames (see src/adapter/dsh.rs).
+# Frame *boundaries* are found structurally (a port of the DSH backend's own
+# scanner); this crate only decompresses the complete frames it is handed.
+zstd = "0.13"
 # In-process eBPF loader (v0.5). Pure Rust — no libbpf, no C toolchain, which is
 # the whole point of dropping the `bpftrace` subprocess.
 aya = "0.14.0"

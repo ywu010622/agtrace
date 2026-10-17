@@ -515,7 +515,32 @@ fn resolve_config(events: &std::path::Path, cfg: &LoaderCfg) -> Result<Vec<u64>,
     set(abi::CFG_SENDTO_FD, &f_sendto, "sys_enter_sendto", "fd")?;
     set(abi::CFG_SENDTO_LEN, &f_sendto, "sys_enter_sendto", "len")?;
 
-    set(abi::CFG_EXIT_GROUP_DEAD, &f_exit, "sched_process_exit", "group_dead")?;
+    // `group_dead` exists only from mainline 6.8 on. LTS kernels (5.15 — which
+    // includes WSL2's kernel) and older expose `sched_process_exit` without it,
+    // and refusing to load made the default collector unusable on them. Fall
+    // back to "group leader is exiting" (`tgid == tid`) in the probe, and keep
+    // the offset slot pointing at a valid field so the (unused) read in the
+    // fallback branch stays in bounds. The fallback is stated on stderr; it is
+    // equivalent for single-threaded tool commands.
+    match f_exit.field("group_dead", "sched_process_exit") {
+        Ok(field) => c[abi::CFG_EXIT_GROUP_DEAD as usize] = field.encode(),
+        Err(e) => {
+            let pid_field = f_exit.field("pid", "sched_process_exit").map_err(|e2| {
+                format!(
+                    "{} — and without `pid` either the exit probe cannot be built: {}",
+                    e, e2
+                )
+            })?;
+            c[abi::CFG_EXIT_GROUP_DEAD as usize] = pid_field.encode();
+            c[abi::CFG_EXIT_GROUP_DEAD_FALLBACK as usize] = 1;
+            eprintln!(
+                "agtrace-ebpf: {} — falling back to group-leader exit detection \
+                 (`tgid == tid`); equivalent for single-threaded commands, and a \
+                 multi-threaded target's exit may be dated by its leader's exit",
+                e
+            );
+        }
+    }
 
     // The exit status of a signal death is not on any syscall tracepoint; it is
     // read off `task_struct`, whose layout comes from the kernel's own BTF.

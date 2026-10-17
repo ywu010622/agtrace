@@ -735,13 +735,25 @@ impl Event {
 }
 
 /// 渲染用的 key 列（§4.2）：agent 层用 session_id 前 8 位，内核层用 pid。
+///
+/// DSH 的 session id 是 `session-<uuid>`：取前 8 位只会得到 `session-`，
+/// 一个没有信息量的列。固定前缀先剥掉再取，其他 harness 的裸 id 行为不变。
 pub fn corr_key(layer: Layer, corr: &Corr, pid: Option<u32>) -> String {
+    fn short(s: &str) -> String {
+        let rest = s.strip_prefix("session-").unwrap_or(s);
+        let take: String = rest.chars().take(8).collect();
+        if take.is_empty() {
+            s.chars().take(8).collect()
+        } else {
+            take
+        }
+    }
     match layer {
         Layer::Agent => corr
             .session_id
             .as_deref()
-            .map(|s| s.chars().take(8).collect::<String>())
-            .or_else(|| corr.run_id.as_deref().map(|s| s.chars().take(8).collect()))
+            .map(short)
+            .or_else(|| corr.run_id.as_deref().map(short))
             .unwrap_or_else(|| "-".to_string()),
         _ => pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string()),
     }
@@ -836,4 +848,29 @@ pub fn errno_is_pending(e: i64) -> bool {
 /// 但出现的时候不该是坏的。未知 errno 给 `"?"`，渲染层会写成 `ERRNO(-N)`。
 pub fn errno_label(e: i64) -> String {
     errno_name(e).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_column_needs_the_real_session_id_not_the_adapter_prefix() {
+        let mut c = Corr {
+            session_id: Some("session-e8694b65-060a-4890-a6ca-b202e87537ce".into()),
+            ..Default::default()
+        };
+        assert_eq!(corr_key(Layer::Agent, &c, None), "e8694b65");
+        // 裸 uuid（Claude Code）保持原行为。
+        c.session_id = Some("a740509c-1111-2222-3333-444455556666".into());
+        assert_eq!(corr_key(Layer::Agent, &c, None), "a740509c");
+        // 没有 session id 时退到 run_id，再退到 "-"。
+        c.session_id = None;
+        c.run_id = Some("run-1234567890".into());
+        assert_eq!(corr_key(Layer::Agent, &c, None), "run-1234");
+        c.run_id = None;
+        assert_eq!(corr_key(Layer::Agent, &c, None), "-");
+        // 内核层仍然是 pid。
+        assert_eq!(corr_key(Layer::Runtime, &c, Some(4242)), "4242");
+    }
 }

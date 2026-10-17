@@ -262,7 +262,14 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     let mut bind_cwd: Option<String> = None;
     let mut transcript_path: Option<String> = None;
 
-    if let Some(src) = &cli.session {
+    // `--transcript` is the long-standing alias for "here is the agent layer
+    // source"; it used to be parsed and then ignored, which silently produced a
+    // timeline with a kernel half only. It now feeds the same slot as `-S`
+    // (`-S` wins when both are given, and the choice is noted below).
+    let adapter_source = cli.session.clone().or_else(|| cli.transcript.clone());
+    let both_agent_sources = cli.session.is_some() && cli.transcript.is_some();
+
+    if let Some(src) = &adapter_source {
         match cli.adapter.as_str() {
             "claude-code" => {
                 let cfg = adapter::claude_code::AdapterCfg {
@@ -283,22 +290,48 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 transcript_path = Some(a.path().display().to_string());
                 adapters.push(Box::new(a));
             }
+            "dsh" => {
+                let cfg = adapter::dsh::AdapterCfg {
+                    tool_arg_max: cli.tool_arg_max,
+                    bash_cmd_max: cli.bash_cmd_max,
+                    redact: cli.redact,
+                };
+                let mut a =
+                    adapter::dsh::DshAdapter::new(src, cfg, cli.follow).map_err(|e| e.to_string())?;
+                // 启动时校验（§5.4 #4）：第一条记录必须是 DSH session 头。
+                a.validate().map_err(|e| e.to_string())?;
+                session_desc = Some(short_session_id(a.session_id.as_deref(), src));
+                bind_session_id = a.session_id.clone();
+                bind_cwd = a.cwd.clone();
+                transcript_path = Some(format!("{} (dsh)", a.path().display()));
+                adapters.push(Box::new(a));
+            }
             "openshell" => {
-                let a = adapter::openshell::OpenShellAdapter::new(src, cli.time_base, cli.tool_arg_max)
-                    .map_err(|e| e.to_string())?;
+                let a = adapter::openshell::OpenShellAdapter::new(
+                    src,
+                    cli.time_base,
+                    cli.tool_arg_max,
+                    cli.redact,
+                )
+                .map_err(|e| e.to_string())?;
                 // fixture 没有真正的会话标识，硬凑一个只会在表头里产生噪声。
                 target_desc = format!("openshell fixture {}", file_basename(src));
                 adapters.push(Box::new(a));
             }
             "jsonl" => {
-                let a = adapter::jsonl::JsonlAdapter::new(src, cli.tool_arg_max, cli.follow)
-                    .map_err(|e| e.to_string())?;
+                let a = adapter::jsonl::JsonlAdapter::new(
+                    src,
+                    cli.tool_arg_max,
+                    cli.follow,
+                    cli.redact,
+                )
+                .map_err(|e| e.to_string())?;
                 target_desc = format!("jsonl events {}", file_basename(src));
                 adapters.push(Box::new(a));
             }
             other => {
                 return Err(format!(
-                    "unknown --adapter `{}` (available: claude-code | openshell | jsonl)",
+                    "unknown --adapter `{}` (available: claude-code | dsh | openshell | jsonl)",
                     other
                 ));
             }
@@ -355,6 +388,9 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     };
 
     let mut notes: Vec<String> = Vec::new();
+    if both_agent_sources {
+        notes.push("-S and --transcript both name the agent source; -S takes precedence".to_string());
+    }
     if let Some(p) = &transcript_path {
         notes.push(format!("transcript: {}", p));
     }
@@ -422,7 +458,11 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    write_out(&mut out, cli, &text_renderer.header(&header))?;
+    // Text and JSON banners describe the same run; render the text one first
+    // (it also drives `text_renderer`'s origin/lock state) and then hand both to
+    // one writer, so JSON mode emits the **fields**, not the text banner.
+    let text_banner = text_renderer.header(&header);
+    write_out(&mut out, cli, &header, &text_banner)?;
 
     // ---------------- v0.6 离线回放：两条流先抽干，再按时间序喂 ----------------
     //
@@ -467,6 +507,11 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
                 }
                 let n = v.len();
                 for mut ev in v {
+                    // §4.1：--source 不含 agent 时，agent 行不进流水线。回放与
+                    // 实时走同一条门槛，否则同一份会话在两种模式下会给出不同的来源。
+                    if !sources.agent {
+                        continue;
+                    }
                     if a.capabilities().needs_pid_binding {
                         stamp_agent(&mut ev, &bind, cli);
                     }
@@ -579,11 +624,15 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
             // 只有声明 needs_pid_binding 的 adapter 才盖章 —— 给一个与进程树无关的
             // fixture 盖上 binding 标记，等于凭空制造一个不存在的关联。
             let stamp = a.capabilities().needs_pid_binding;
-            for mut ev in evs {
-                if stamp {
-                    stamp_agent(&mut ev, &bind, cli);
+            // `--source` 对 agent 层同样生效（§4.1）：`--source exec` 却打出 agent
+            // 行，横幅就会声称一个与屏幕不符的来源集合。
+            if sources.agent {
+                for mut ev in evs {
+                    if stamp {
+                        stamp_agent(&mut ev, &bind, cli);
+                    }
+                    merger.push_agent(ev);
                 }
-                merger.push_agent(ev);
             }
         }
         } // !replay_mode：回放的两条流已在进循环前喂完
@@ -591,11 +640,23 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         merger.clock.maybe_resync();
         merger.flush_due();
 
-        let ready = merger.take_ready();
+        let mut ready = merger.take_ready();
+        // `--max-events` 数的是**采集到的**事件，不是打印出来的行数：折叠改变的
+        // 是呈现，不该顺手把上限也改掉（否则同样的参数在折叠开关两边的采集量
+        // 会不一样，成了"显示影响了采集"）。
+        //
+        // 上限必须在**写出这一批之前**执行：离线回放（`-S` / `--kernel-lines`）
+        // 会把整条流塞进第一批，只在轮询间隙检查上限的话，整份时间线都会打出来，
+        // 然后 stderr 再说一句"truncated" —— 那是一句与屏幕不符的话。
+        let mut hit_limit = false;
+        if let Some(m) = cli.max_events {
+            let room = m.saturating_sub(total_out) as usize;
+            if ready.len() > room {
+                ready.truncate(room);
+                hit_limit = true;
+            }
+        }
         if !ready.is_empty() {
-            // `--max-events` 数的是**采集到的**事件，不是打印出来的行数：
-            // 折叠改变的是呈现，不该顺手把上限也改掉（否则同样的参数在
-            // 折叠开关两边的采集量会不一样，成了"显示影响了采集"）。
             total_out += ready.len() as u64;
             // v0.3：先绑（可能插入 bind 证据行），再折。两步都只改呈现与标记，
             // 不改 `total_out` —— 上限数的始终是**采集到的**事件。
@@ -629,6 +690,11 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
             }
         }
 
+        if hit_limit {
+            truncated_by_limit = true;
+            break;
+        }
+
         // --- 退出判定 ---
         //
         // `can_follow` 必须**每轮重算**，不能在启动时定一次。原因：bpfrace 可能
@@ -637,11 +703,12 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
         // 用户看到的是"卡住了"，而不是"采集器已经死了"。这个 bug 在验收 #1 里
         // 真实发生过：进程树跑完、bpftrace 已退出，agtrace 还在 loop 里等。
         let can_follow = (collector.is_some() && !kdone)
-            || adapters
-                .iter()
-                .zip(agent_eof.iter())
-                .any(|(a, eof)| !eof && a.capabilities().live);
-        let adone = agent_eof.iter().all(|x| *x);
+            || (sources.agent
+                && adapters
+                    .iter()
+                    .zip(agent_eof.iter())
+                    .any(|(a, eof)| !eof && a.capabilities().live));
+        let adone = !sources.agent || agent_eof.iter().all(|x| *x);
         if kdone && adone && (!cli.follow || !can_follow) {
             break;
         }
@@ -831,7 +898,15 @@ fn run_inner(cli: &Cli) -> Result<(), String> {
             "seen": failer.claims_seen,
             "checked": failer.claims_checked,
             "unverified": failer.claims_unverified,
+            // `unverified_unlinked` 是"未核对"里最危险的一类：调用没有 join key，
+            // 它的"内核证据集合"在结构上是空的。把这类也算进 mismatch，会把
+            // 没证据说成反证（§14.2 的铁律）。
+            "unverified_unlinked": failer.claims_unverified_unlinked,
+            "unverified_reason": failer.claims_unverified_reason,
             "mismatched": failer.claims_mismatched,
+            // tool.result 带着一个不认识的 tool_use_id 落不到任何 pending 调用上。
+            // 静默丢弃会让"这条结果去哪了"变成一个只能翻源码回答的问题。
+            "unmatched_results": failer.unmatched_results,
         },
         // v0.6 §14.4：离线回放的来料账。回放必须**自报家门**（这份文件里有多少行、
         // 有几行没认出来），否则"内核里没有那条写"会被读成内核事实。
@@ -929,10 +1004,30 @@ fn lock_origin_if_filtered(cli: &Cli, failer: &FailAttributor, r: &mut TextRende
     }
 }
 
-fn write_out<W: Write>(w: &mut W, cli: &Cli, s: &str) -> Result<(), String> {
+/// 启动横幅。text 模式直接写渲染器给的横幅；json 模式写**结构化字段**。
+///
+/// 这里曾经把 text 横幅整段塞进 JSON 的 `target` 字段（session/binding/sources/
+/// notes 全是空的），下游按 `json` 解析时拿到的是带换行的人类文本 —— 这是
+/// `--output json` 契约的破坏，必须在唯一的写出点修掉，而不是各写各的。
+fn write_out<W: Write>(
+    w: &mut W,
+    cli: &Cli,
+    header: &Header,
+    rendered_text: &str,
+) -> Result<(), String> {
     let line = match cli.output {
-        OutputMode::Text => format!("{}\n", s),
-        OutputMode::Json => format!("{}\n", render::json::header(s, None, None, &[], cli.follow, &[],)),
+        OutputMode::Text => format!("{}\n", rendered_text),
+        OutputMode::Json => format!(
+            "{}\n",
+            render::json::header(
+                &header.target,
+                header.session.as_deref(),
+                header.binding.map(|b| b.as_str()),
+                &header.sources,
+                header.following,
+                &header.notes,
+            )
+        ),
     };
     w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())
@@ -960,15 +1055,6 @@ fn print_diagnostics(
     failer: &FailAttributor,
     ls: lineage::LineageStats,
 ) {
-    // 这一节**不套** §3 的 120 列上限：它是给人 grep 的 key=value 转储，
-    // 截断它等于把 `-v` 存在的理由截掉。上限管的是时间线（横幅 / 事件行 / 统计行），
-    // 以及默认模式下的全部输出。
-    // 这一节**不套** §3 的 120 列上限：它是给人 grep 的 key=value 转储，
-    // 截断它等于把 `-v` 存在的理由截掉。上限管的是时间线（横幅 / 事件行 / 统计行），
-    // 以及默认模式下的全部输出。
-    // 这一节**不套** §3 的 120 列上限：它是给人 grep 的 key=value 转储，
-    // 截断它等于把 `-v` 存在的理由截掉。上限管的是时间线（横幅 / 事件行 / 统计行），
-    // 以及默认模式下的全部输出。
     // 这一节**不套** §3 的 120 列上限：它是给人 grep 的 key=value 转储，
     // 截断它等于把 `-v` 存在的理由截掉。上限管的是时间线（横幅 / 事件行 / 统计行），
     // 以及默认模式下的全部输出。
@@ -1068,13 +1154,20 @@ fn print_diagnostics(
     // `matched` 是算出来的（checked - mismatched），不单独存：它不是独立事实。
     eprintln!(
         "  claims (§14.2): seen {}; checked {} (matched {} / mismatched {}); unverified {} \
-         (unverified = never compared against the kernel, not \"verified ok\")",
+         (unverified = never compared against the kernel, not \"verified ok\"); \
+         unverified_unlinked {}; unmatched tool.result(s) {}",
         failer.claims_seen,
         failer.claims_checked,
         failer.claims_checked.saturating_sub(failer.claims_mismatched),
         failer.claims_mismatched,
-        failer.claims_unverified
+        failer.claims_unverified,
+        failer.claims_unverified_unlinked,
+        failer.unmatched_results
     );
+    if let Some(reason) = &failer.claims_unverified_reason {
+        // 为什么"没资格核对"必须能回答：否则 unverified 只是一个让人安心的数字。
+        eprintln!("      unverified reason: {}", reason);
+    }
     if let Some(c) = collector {
         let s = c.parse_stats();
         let id = Collector::id(c);
@@ -1152,5 +1245,29 @@ fn print_diagnostics(
 }
 
 fn file_basename(p: &str) -> String {
-    p.rsplit('/').next().unwrap_or(p).to_string()
+    // Windows paths reach this binary when DSH session files are read from a
+    // Linux host via /mnt or when the user pastes a Windows path; split on both
+    // separators (taking the last non-empty component).
+    p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()
+}
+
+/// 表头里的短会话标识。
+///
+/// Claude Code 的 session id 是裸 uuid，取前 8 位足够；DSH 的 id 是
+/// `session-<uuid>`，直接取前 8 位会得到一个没有信息量的 `session-`。
+/// 这里去掉这个固定前缀后再取（仍然是缩略，完整 id 在 `-v` / `--output json`
+/// 的 `corr.session_id` 里）。
+fn short_session_id(id: Option<&str>, fallback: &str) -> String {
+    match id {
+        Some(s) => {
+            let rest = s.strip_prefix("session-").unwrap_or(s);
+            let take: String = rest.chars().take(8).collect();
+            if take.is_empty() {
+                s.to_string()
+            } else {
+                take
+            }
+        }
+        None => fallback.to_string(),
+    }
 }

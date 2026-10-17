@@ -100,7 +100,14 @@ pub const CFG_EXIT_GROUP_DEAD: u32 = 18;
 /// No syscall tracepoint sees the exit status of a signal death, so this is read
 /// off the task the way bpftrace's `curtask->exit_code` was.
 pub const CFG_TASK_EXIT_CODE: u32 = 19;
-pub const CFG_COUNT: u32 = 20;
+/// `1` when this kernel's `sched_process_exit` tracepoint has **no** `group_dead`
+/// field (mainline added it in 6.8; LTS kernels such as 5.15 — and WSL2's kernel —
+/// do not have it). The probe then falls back to "the group leader is exiting"
+/// (`tgid == tid`, from `bpf_get_current_pid_tgid`), which is equivalent for the
+/// single-threaded commands agent tool calls spawn. Present in the ABI from the
+/// start (default 0) so the record layout and the config array never disagree.
+pub const CFG_EXIT_GROUP_DEAD_FALLBACK: u32 = 20;
+pub const CFG_COUNT: u32 = 21;
 
 pub const MODE_PID_TREE: u64 = 0;
 pub const MODE_CGROUP: u64 = 1;

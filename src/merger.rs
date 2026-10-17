@@ -306,10 +306,15 @@ impl Merger {
 
     /// 采集器异常结束（bpfrace 挂了）时插入一条显式记录 —— 丢包绝不静默（§4.3）。
     pub fn push_collector_end(&mut self, reason: &str) {
+        // `ts_wall_ns` used to be left at 0 here; the renderer's relative clock is
+        // wall-based, so the row rendered at 0.000000 and never became the time
+        // origin. Fill both clocks from the same "now".
+        let ts_ns = mono_now_ns();
+        let ts_wall_ns = self.clock.wall_from_mono(ts_ns);
         let ev = Event {
             seq: self.next_seq(),
-            ts_ns: mono_now_ns(),
-            ts_wall_ns: 0,
+            ts_ns,
+            ts_wall_ns,
             ts_src: TsSource::Kernel,
             layer: Layer::Derived,
             kind: crate::event::Kind::CollectorLostEvents,
@@ -483,5 +488,20 @@ mod tests {
         let out = m.take_ready();
         let pids: Vec<u32> = out.iter().map(|e| e.pid.unwrap()).collect();
         assert_eq!(pids, vec![0, 1, 2, 3, 4], "同 ts 时未按 seq 稳定排序");
+    }
+
+    /// 采集器异常结束行必须带上墙钟时间，否则它在渲染器里落在 0.000000
+    /// （相对时间基于 `ts_wall_ns`），也永远不会成为时间原点的一部分。
+    #[test]
+    fn collector_end_row_carries_a_wall_clock_time() {
+        let mut m = Merger::new(200, 0, Views::disabled());
+        let before = mono_now_ns();
+        m.push_collector_end("boom");
+        let out = m.take_ready();
+        assert_eq!(out.len(), 1, "collector end must be emitted immediately");
+        let ev = &out[0];
+        assert!(ev.ts_ns >= before, "ts_ns was not stamped: {}", ev.ts_ns);
+        assert!(ev.ts_wall_ns > 0, "collector end row has no wall time — renders as 0.000000");
+        assert_eq!(ev.ts_wall_ns, m.clock.wall_from_mono(ev.ts_ns));
     }
 }

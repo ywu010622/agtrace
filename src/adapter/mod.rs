@@ -4,6 +4,7 @@
 //! 主循环用一个简单的多路复用轮询，adapter 不得阻塞超过 ~10ms。
 
 pub mod claude_code;
+pub mod dsh;
 pub mod jsonl;
 pub mod openshell;
 
@@ -197,26 +198,54 @@ pub fn agent_event(
 ///
 /// 三个必须处理的现实：
 ///  1. 文件可能**还不存在**（会话刚启动）→ 不是错误，返回 Idle。
-///  2. 文件可能被**轮转/重建**（inode 变化）→ 重置 offset。
+///  2. 文件可能被**轮转/重建**（inode 变化）或**原地截断重写** → 重置 offset。
 ///  3. 写入**不保证以完整行结束** `[未验证]` → 半行留在缓冲区等下次（§5.4 #3）。
+///
+/// 恢复动作（restart from 0）从不假装无代价：`restarts` / `last_restart` /
+/// `possible_duplicates` 记录发生了什么，调用方可以把它们放进诊断。截断+重写
+/// 如果恰好发生在两次 poll 之间、新内容又长过旧 offset，`len < offset` 看不见它
+/// —— 所以每轮 poll 都会用 `consumed_tail` 核对 offset 之前的一小段字节是否仍是
+/// 我们读过的内容（见 `poll` 里的 `still_matches_tail`）。
 pub struct FileTail {
     pub path: std::path::PathBuf,
     file: Option<std::fs::File>,
+    /// (device, inode)。只比较 inode 号挡不住 inode 复用 / 跨设备替换。
+    dev: u64,
     inode: u64,
     offset: u64,
     buf: crate::collector::LineBuffer,
     pub ever_opened: bool,
+    /// 从 offset 0 读到的文件头若干字节：用来判断 restart 后重读的前缀是否和
+    /// 已经输出过的内容相同（相同 → 可能有重复事件）。
+    file_start: Option<Vec<u8>>,
+    /// offset 之前最近读过的若干字节：下一轮 poll 用它验证这些字节没被重写。
+    consumed_tail: Vec<u8>,
+    /// 从 0 重新读的次数（截断 / 轮转 / 检测到重写）。
+    pub restarts: u64,
+    /// 最近一次 restart 的原因，供诊断（`-v` / adapter diagnostics）使用。
+    pub last_restart: Option<String>,
+    /// restart 后重读的前缀与已输出内容相同 → 可能有重复事件被再次产出。
+    pub possible_duplicates: u64,
 }
+
+/// 核对/记录文件内容的字节数（前缀指纹 + 已消费尾巴）。
+const FINGERPRINT_LEN: usize = 64;
 
 impl FileTail {
     pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
         FileTail {
             path: path.into(),
             file: None,
+            dev: 0,
             inode: 0,
             offset: 0,
             buf: crate::collector::LineBuffer::new(),
             ever_opened: false,
+            file_start: None,
+            consumed_tail: Vec::new(),
+            restarts: 0,
+            last_restart: None,
+            possible_duplicates: 0,
         }
     }
 
@@ -237,30 +266,82 @@ impl FileTail {
             Err(e) => return Err(e),
         };
 
-        let ino = inode_of(&meta);
-        let len = meta.len();
+        let (meta_dev, meta_ino) = identity_of(&meta);
+        let meta_len = meta.len();
 
-        let need_reopen = self.file.is_none() || self.inode != ino || len < self.offset;
-        if need_reopen {
-            let mut f = std::fs::File::open(&self.path)?;
-            // 被截断（len < offset）时从头再来，绝不假设内容连续。
-            self.offset = if self.inode == ino && len < self.offset {
-                0
-            } else if self.inode != ino {
-                0
-            } else {
-                self.offset
-            };
-            f.seek(SeekFrom::Start(self.offset))?;
-            self.file = Some(f);
-            self.inode = ino;
-            self.ever_opened = true;
-            // inode 变化 = 新文件，缓冲里的半行属于旧文件，必须丢弃。
-            if self.offset == 0 {
-                self.buf = crate::collector::LineBuffer::new();
-            }
+        let need_reopen = self.file.is_none()
+            || self.dev != meta_dev
+            || self.inode != meta_ino
+            || meta_len < self.offset;
+
+        // 截断+重写可能整个发生在两次 poll 之间：长度已经长回旧 offset 以上，
+        // `len < offset` 看不见。在信任 offset 之前，核对 offset 之前的一小段
+        // 字节是否仍是我们消费过的内容（一次 read_at，64 字节）。
+        let mut rewritten = false;
+        if !need_reopen
+            && self.offset > 0
+            && !self.consumed_tail.is_empty()
+            && let Some(f) = self.file.as_ref()
+        {
+            rewritten = !still_matches_tail(f, self.offset, &self.consumed_tail)?;
         }
 
+        let mut restarted_from_offset: u64 = 0;
+        let mut restart_old_start: Option<Vec<u8>> = None;
+
+        if need_reopen || rewritten {
+            let mut f = std::fs::File::open(&self.path)?;
+            // 相信**打开的那个句柄**，而不是与它竞争的路径 metadata：metadata 与
+            // open 之间文件被替换时，旧代码会存下旧 inode，下一轮就重读整个新文件。
+            let actual = f.metadata()?;
+            let (dev, ino) = identity_of(&actual);
+            let len = actual.len();
+
+            let same_identity = self.ever_opened && self.dev == dev && self.inode == ino;
+            let truncated = same_identity && len < self.offset;
+            let rotated = self.ever_opened && !same_identity;
+            let mut reset = truncated || rotated || rewritten;
+            // need_reopen 也可能只是因为 file 句柄丢了（文件消失又回来）；若身份
+            // 没变、长度也没缩，就还是同一个文件，接着读。但 metadata 可能和 open
+            // 竞争，所以再对着句柄核对一次尾巴。
+            if !reset && same_identity && self.offset > 0 && !self.consumed_tail.is_empty() {
+                reset = !still_matches_tail(&f, self.offset, &self.consumed_tail)?;
+            }
+
+            if reset {
+                restarted_from_offset = self.offset;
+                restart_old_start = self.file_start.take();
+                // restart 意味着"我们读过的字节不再是以为的那些字节"：缓冲区里的
+                // 半行属于旧内容/旧 offset，必须丢掉，绝不能让它和新内容拼成一条
+                // 看起来完整的行。
+                self.buf = crate::collector::LineBuffer::new();
+                self.consumed_tail.clear();
+                self.offset = 0;
+                self.restarts += 1;
+                let why = if truncated {
+                    format!(
+                        "file truncated (length {} < old offset {}); restarting from 0",
+                        len, restarted_from_offset
+                    )
+                } else if rotated {
+                    "file replaced (device/inode changed); restarting from 0".to_string()
+                } else {
+                    format!(
+                        "content before offset {} changed (truncate+rewrite between polls); restarting from 0",
+                        restarted_from_offset
+                    )
+                };
+                self.last_restart = Some(why);
+            }
+
+            f.seek(SeekFrom::Start(self.offset))?;
+            self.file = Some(f);
+            self.dev = dev;
+            self.inode = ino;
+            self.ever_opened = true;
+        }
+
+        let started_at_zero = self.offset == 0;
         let mut out = Vec::new();
         if let Some(f) = self.file.as_mut() {
             let mut chunk = [0u8; 65536];
@@ -268,27 +349,85 @@ impl FileTail {
                 match f.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let data = &chunk[..n];
+                        if started_at_zero && self.file_start.is_none() {
+                            let take = n.min(FINGERPRINT_LEN);
+                            self.file_start = Some(data[..take].to_vec());
+                        }
                         self.offset += n as u64;
-                        out.extend(self.buf.push(&chunk[..n]));
+                        self.consumed_tail.extend_from_slice(data);
+                        if self.consumed_tail.len() > FINGERPRINT_LEN {
+                            let cut = self.consumed_tail.len() - FINGERPRINT_LEN;
+                            self.consumed_tail.drain(..cut);
+                        }
+                        out.extend(self.buf.push(data));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
                 }
             }
         }
+
+        // restart 之后重读到与旧文件头相同的前缀 → 我们已经输出过的行可能被再次
+        // 输出。这是启发式（只比前 64 字节），但**计数**而不是假装干净。
+        if restarted_from_offset > 0
+            && let (Some(old), Some(new)) = (restart_old_start.as_deref(), self.file_start.as_deref())
+            && old == new
+        {
+            self.possible_duplicates += 1;
+        }
+
         Ok((out, false))
+    }
+
+    /// 尚未组成完整行的字节数（流被截断在行中间时用于收尾诊断，§4.3）。
+    pub fn pending_bytes(&self) -> usize {
+        self.buf.pending_bytes()
     }
 }
 
+/// 核对 `offset` 之前的 `tail` 个字节是否仍是我们读过的内容。
+///
+/// `Ok(false)` = 文件被截断后重写（且已长回旧 offset 以上），此时继续从旧
+/// offset 读会把新内容从中间切开。`read_at` 不移动文件游标。
 #[cfg(unix)]
-fn inode_of(m: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    m.ino()
+fn still_matches_tail(
+    f: &std::fs::File,
+    offset: u64,
+    tail: &[u8],
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let n = tail.len() as u64;
+    if tail.is_empty() || offset < n {
+        return Ok(true);
+    }
+    let mut got = vec![0u8; tail.len()];
+    let read = f.read_at(&mut got, offset - n)?;
+    if read != got.len() {
+        // 短读说明文件比 offset 还短（正常情况下上面已经按截断处理了）。
+        return Ok(false);
+    }
+    Ok(got == tail)
 }
 
 #[cfg(not(unix))]
-fn inode_of(_m: &std::fs::Metadata) -> u64 {
-    0
+fn still_matches_tail(
+    _f: &std::fs::File,
+    _offset: u64,
+    _tail: &[u8],
+) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn identity_of(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+#[cfg(not(unix))]
+fn identity_of(_m: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
 }
 
 #[cfg(test)]
@@ -334,5 +473,119 @@ mod tests {
         assert!(parse_iso8601_ns("2024-02-29T00:00:00Z").is_some());
         let ns = parse_iso8601_ns("2000-03-01T00:00:00Z").unwrap();
         assert_eq!(iso8601_ms(ns), "2000-03-01T00:00:00.000Z");
+    }
+
+    // ---- FileTail ----
+
+    fn tail_test_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agtrace_filetail_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("cannot create temp dir");
+        dir.join("events.jsonl")
+    }
+
+    fn tail_lines(t: &mut FileTail) -> Vec<String> {
+        let (lines, _gone) = t.poll().expect("tail poll failed");
+        lines
+    }
+
+    /// 文件在 adapter 启动之后才出现：不是错误，出现后从 0 读，不能当成 EOF。
+    #[test]
+    fn a_file_created_after_start_is_picked_up_from_zero() {
+        let p = tail_test_path("created_later");
+        let mut t = FileTail::new(&p);
+        let (lines, gone) = t.poll().unwrap();
+        assert!(lines.is_empty());
+        assert!(!gone, "a file that was never seen must not be reported as a vanished source");
+        std::fs::write(&p, "hello\nworld\n").unwrap();
+        assert_eq!(tail_lines(&mut t), vec!["hello".to_string(), "world".into()]);
+        assert!(t.ever_opened);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 截断之后**又长过旧 offset**：`len < offset` 看不见这种重写，旧代码会从旧
+    /// offset 接着读（丢掉新文件开头、还可能从行中间开始）。尾部指纹必须识破它。
+    #[test]
+    fn truncate_then_regrow_past_the_old_offset_is_detected() {
+        let p = tail_test_path("truncate_regrow");
+        std::fs::write(&p, "alpha\nbeta\n").unwrap();
+        let mut t = FileTail::new(&p);
+        assert_eq!(tail_lines(&mut t), vec!["alpha".to_string(), "beta".into()]);
+        // 原地重写成**更长**的内容，整个发生在两次 poll 之间。
+        std::fs::write(&p, "gamma\ndelta\nepsilon\n").unwrap();
+        let lines = tail_lines(&mut t);
+        assert_eq!(
+            lines,
+            vec!["gamma".to_string(), "delta".into(), "epsilon".into()],
+            "truncate+regrow was missed; the tail resumed at a stale offset"
+        );
+        assert_eq!(t.restarts, 1);
+        assert!(
+            t.last_restart.as_deref().unwrap_or("").contains("between polls"),
+            "restart reason must say what was detected: {:?}",
+            t.last_restart
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 检测到重写后，如果重读前缀和已输出内容相同，旧行可能被再次输出：
+    /// 计数（`possible_duplicates`），而不是假装干净。
+    #[test]
+    fn a_detected_rewrite_with_an_identical_prefix_counts_possible_duplicates() {
+        let p = tail_test_path("dup_prefix");
+        let prefix = "x".repeat(70);
+        std::fs::write(&p, format!("{}\nold\n", prefix)).unwrap();
+        let mut t = FileTail::new(&p);
+        assert_eq!(tail_lines(&mut t), vec![prefix.clone(), "old".to_string()]);
+        std::fs::write(&p, format!("{}\nnew\n", prefix)).unwrap();
+        let lines = tail_lines(&mut t);
+        assert_eq!(
+            lines,
+            vec![prefix.clone(), "new".to_string()],
+            "rewrite not recognised; poll resumed at a stale offset"
+        );
+        assert_eq!(t.restarts, 1);
+        assert_eq!(
+            t.possible_duplicates, 1,
+            "re-reading a prefix equal to already-emitted content must be counted"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 任何 restart 都必须丢掉缓冲里的半行，否则旧内容的后半行会和新内容的
+    /// 开头拼成一条"完整"的假行。
+    #[test]
+    fn a_restart_drops_the_buffered_partial_line() {
+        let p = tail_test_path("partial_reset");
+        std::fs::write(&p, "partial").unwrap(); // no trailing newline
+        let mut t = FileTail::new(&p);
+        assert!(tail_lines(&mut t).is_empty());
+        assert_eq!(t.pending_bytes(), 7);
+        // 截断成更短的内容 → 检测到 restart；旧半行绝不能成为新行的前缀。
+        std::fs::write(&p, "new\n").unwrap();
+        assert_eq!(
+            tail_lines(&mut t),
+            vec!["new".to_string()],
+            "stale partial line was completed with bytes from the new file"
+        );
+        assert_eq!(t.pending_bytes(), 0);
+        assert_eq!(t.restarts, 1);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// 轮转（rename 换 inode）要重新从 0 读，而不是继续用旧 offset。
+    #[test]
+    fn a_replaced_file_is_reopened_from_zero() {
+        let p = tail_test_path("rotate");
+        std::fs::write(&p, "one\ntwo\n").unwrap();
+        let mut t = FileTail::new(&p);
+        assert_eq!(tail_lines(&mut t), vec!["one".to_string(), "two".into()]);
+        let q = p.with_extension("next");
+        std::fs::write(&q, "other\n").unwrap();
+        std::fs::rename(&q, &p).unwrap();
+        assert_eq!(tail_lines(&mut t), vec!["other".to_string()]);
+        assert_eq!(t.restarts, 1);
+        assert_eq!(t.possible_duplicates, 0);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

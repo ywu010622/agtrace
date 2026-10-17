@@ -42,30 +42,31 @@ impl EmitCfg {
 }
 
 /// The string in slot `i`, with the truncation marker restored.
+///
+/// Kernel strings are bytes; on Linux a path/argv/comm is UTF-8 in the normal case.
+/// This used to map each byte through `b as char` (Latin-1), which silently turned
+/// every non-ASCII path into mojibake and made the aya collector disagree with the
+/// bpftrace collector about the same bytes — and it broke argv binding against the
+/// (correctly UTF-8) transcript side. Decode once, lossily, exactly the way the
+/// bpftrace path's `LineBuffer` does; only the two characters that would break line
+/// framing are then replaced.
 fn s(rec: &RawEvent, i: usize) -> String {
     let raw = rec.str_bytes(i);
     if raw.is_empty() {
         return String::new();
     }
-    let mut v: String = raw.iter().map(|&b| safe_char(b)).collect();
+    let mut v = String::from_utf8_lossy(raw).into_owned();
+    // A filename may legally contain a newline. bpftrace printed it verbatim, which
+    // tore the line in half and cost that event (the parser counts it as malformed).
+    // Replacing only `\n` and `\r` keeps every line exactly one line without
+    // touching anything a path can legitimately contain.
+    if v.contains(['\n', '\r']) {
+        v = v.replace(['\n', '\r'], "?");
+    }
     if rec.is_trunc(i) {
         v.push_str(TRUNC_MARK);
     }
     v
-}
-
-/// One byte of a kernel string, with the two characters that would break line
-/// framing replaced.
-///
-/// A filename may legally contain a newline. bpftrace printed it verbatim, which
-/// tore the line in half and cost that event (the parser counts it as malformed).
-/// Replacing only `\n` and `\r` keeps every line exactly one line without
-/// touching anything a path can legitimately contain.
-fn safe_char(b: u8) -> char {
-    match b {
-        b'\n' | b'\r' => '?',
-        _ => b as char,
-    }
 }
 
 /// IPv4/IPv6 from the raw address bytes the eBPF side copied out of the sockaddr.
@@ -342,6 +343,45 @@ mod tests {
         let text = fmt(&r);
         assert_eq!(text.lines().count(), 1, "{:?}", text);
         assert!(text.contains("a?b"));
+    }
+
+    /// 内核侧字符串是字节；Linux 上的路径/argv 正常就是 UTF-8。曾经逐字节
+    /// `b as char`（Latin-1）解码，于是默认的 aya 采集器把每个非 ASCII 路径都变成
+    /// mojibake，与 bpftrace / transcript 侧的 UTF-8 对不上（argv 绑定随之失效）。
+    #[test]
+    fn non_ascii_strings_are_decoded_as_utf8_not_latin1() {
+        let mut r = rec(KIND_OPEN);
+        r.n0 = 0x241; // O_WRONLY|O_CREAT|O_TRUNC
+        r.n1 = -100;
+        r.n2 = 3;
+        set(&mut r, 0, "测试.txt");
+        let text = fmt(&r);
+        assert_eq!(text, "OPEN|1000|42|43|7|99|241|-100|3|测试.txt\n");
+        assert!(!text.contains('\u{e6}'), "Latin-1 解码的残留: {:?}", text);
+
+        let mut r = rec(KIND_EXEC);
+        r.n0 = 2; // two argv slots
+        r.n_str = MAX_STRS as u32;
+        set(&mut r, 0, "bash");
+        set(&mut r, 1, "/usr/bin/bash");
+        set(&mut r, 2, "echo");
+        set(&mut r, 3, "中文");
+        let text = fmt(&r);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{:?}", lines); // EXEC + 2 ARGV
+        assert_eq!(lines[2], "ARGV|1000|42|43|1|中文");
+    }
+
+    #[test]
+    fn invalid_utf8_is_decoded_lossily_not_latin1() {
+        let mut r = rec(KIND_OPEN);
+        r.n0 = 1; // O_WRONLY: a write-intent open is kept by the default filter
+        r.n1 = -100;
+        r.n2 = 3;
+        r.strs[0][..2].copy_from_slice(&[0xFF, b'x']);
+        r.lens[0] = RawEvent::pack_len(2, false);
+        let text = fmt(&r);
+        assert!(text.contains('\u{FFFD}'), "{:?}", text);
     }
 
     #[test]

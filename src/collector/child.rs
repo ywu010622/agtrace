@@ -198,6 +198,32 @@ impl LineChild {
             // last exec of a run is silently dropped.
             parser.finish(out);
             progress = true;
+            // A child that exits *non-zero* is a **failed capture**, not the natural
+            // end of one: `sudo -n` refusing auth, a verifier rejection, a tracepoint
+            // missing on this kernel, a missing `bpftrace` binary. Before this check
+            // every one of those looked exactly like a run whose target did nothing:
+            // the parent saw a clean Eof and printed an empty kernel timeline. Return
+            // the failure (with the exit status and the child's own stderr) so the
+            // caller can put it in the timeline; zero still ends as a clean EOF.
+            if !matches!(st.code(), Some(0)) {
+                // The child may have written its reason just before dying.
+                self.drain_stderr();
+                let tail: Vec<&str> = self.stderr_tail.iter().rev().take(3).rev().map(String::as_str).collect();
+                let tail = if tail.is_empty() {
+                    "(no stderr output)".to_string()
+                } else {
+                    tail.join(" | ")
+                };
+                let status = match st.code() {
+                    Some(code) => format!("exit status {}", code),
+                    None => "killed by signal".to_string(),
+                };
+                let detail = tail.chars().take(400).collect::<String>();
+                return Err(CollectorError::Io(format!(
+                    "{} {}: {}",
+                    self.label, status, detail
+                )));
+            }
         }
 
         if progress {
@@ -238,10 +264,18 @@ impl LineChild {
         self.child_exited.is_none()
     }
 
+    /// One `!! lost_events` row for a detected loss.
+    ///
+    /// The timestamp is the **moment the loss report was read**, not the moment the
+    /// events were dropped (the kernel collector cannot tell us the latter for a
+    /// count). A zero timestamp used to be stamped in here; that put the row at
+    /// `0.000000`, could make the renderer's time origin the machine's boot wall
+    /// clock, and tripped the "nsecs is not CLOCK_MONOTONIC" self-check. A real
+    /// monotonic "now" is the honest value we actually have.
     fn lost_event(&self, count: u64) -> Event {
         Event {
             seq: 0,
-            ts_ns: 0,
+            ts_ns: crate::merger::mono_now_ns(),
             ts_wall_ns: 0,
             ts_src: TsSource::Kernel,
             layer: Layer::Derived,
@@ -255,7 +289,10 @@ impl LineChild {
             corr: Corr::default(),
             payload: Payload::LostEvents { count },
             trunc: Vec::new(),
-            notes: Vec::new(),
+            notes: vec![
+                "timestamp is when the loss was reported by the collector, not when the events were dropped"
+                    .to_string(),
+            ],
             late: false,
             watch: true,
             binding: Binding::None,
@@ -394,6 +431,79 @@ mod tests {
             explicit.iter().any(|k| k == "BPFTRACE_MAX_STRLEN"),
             "调用方设的变量被抹掉了: {:?}",
             explicit
+        );
+    }
+
+    /// 跑一个假采集器子进程直到它结束（Eof）或第一次报错，收集事件。
+    fn drain_fake_child(cmd: Command) -> (Option<String>, Vec<Event>) {
+        let mut c = LineChild::spawn(cmd, "fake-collector", "fake collector").expect("spawn failed");
+        let mut parser = KernelLineParser::with_redact(64, crate::redact::RedactMode::Off);
+        let mut evs = Vec::new();
+        let mut failure = None;
+        for _ in 0..400 {
+            match c.poll_lines(&mut parser, &mut evs) {
+                Ok(PollOutcome::Eof) => break,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        (failure, evs)
+    }
+
+    /// sudo 拒绝授权 / verifier 拒绝 / tracepoint 缺字段，都是"子进程非零退出"这一种
+    /// 形状。它们绝不能被当成"目标什么都没干"的干净结束 —— 必须变成 Err，让上游把
+    /// 退出码和 stderr 放进时间线（§4.3 不静默）。
+    #[test]
+    fn a_nonzero_child_exit_is_a_capture_failure_not_an_eof() {
+        let mut cmd = Command::new("bash");
+        cmd.args([
+            "-c",
+            "echo 'sudo: a password is required' >&2; echo boom >&2; exit 3",
+        ]);
+        let (failure, _) = drain_fake_child(cmd);
+        let msg = failure.expect("non-zero child exit must surface as Err, not clean Eof");
+        assert!(msg.contains("exit status 3"), "{}", msg);
+        assert!(msg.contains("boom"), "{}", msg);
+        assert!(msg.contains("password is required"), "{}", msg);
+    }
+
+    /// 干净退出（0）仍然是自然的 Eof；不能把正常收尾报成失败。
+    #[test]
+    fn a_zero_child_exit_is_still_a_clean_eof() {
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", "exit 0"]);
+        let (failure, _) = drain_fake_child(cmd);
+        assert!(
+            failure.is_none(),
+            "a clean child must not be reported as a failure: {:?}",
+            failure
+        );
+    }
+
+    /// 丢包行必须有真实时间戳。ts=0 会让它出现在 0.000000，还可能把整条时间线的
+    /// 原点改成开机时刻（见 `lost_event` 的注释）。
+    #[test]
+    fn lost_event_is_stamped_with_a_real_monotonic_time() {
+        let before = crate::merger::mono_now_ns();
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", "echo 'Lost 5 events' >&2; sleep 0.1"]);
+        let (failure, evs) = drain_fake_child(cmd);
+        assert!(failure.is_none(), "{:?}", failure);
+        let ev = evs
+            .iter()
+            .find(|e| e.kind == Kind::CollectorLostEvents)
+            .expect("no lost_events row was produced");
+        let after = crate::merger::mono_now_ns();
+        assert!(ev.ts_ns > 0, "lost row must not be stamped 0");
+        assert!(
+            ev.ts_ns >= before && ev.ts_ns <= after,
+            "lost row time {} not inside [{}, {}]",
+            ev.ts_ns,
+            before,
+            after
         );
     }
 }

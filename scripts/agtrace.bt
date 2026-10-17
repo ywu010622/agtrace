@@ -74,7 +74,7 @@ tracepoint:sched:sched_process_fork
         if (@@SRC_EXEC@@) {
             printf("FORK|%llu|%d|%d|%llu|%d|%s|%s\n",
                    nsecs, pid, curtask->real_parent->pid, cgroup,
-                   args->child_pid, str(args->child_comm, 16), comm);
+                   args->child_pid, args->child_comm, comm);
         }
     }
 }
@@ -84,14 +84,20 @@ tracepoint:sched:sched_process_exit
 {
     // 只在最后一个线程退出（进程真正死亡）时产出 EXIT：per-thread 发射会
     // 把多线程 target 的线程退出误报成进程退出（与 aya 侧 on_exit 一致）。
-    if (@@SRC_EXEC@@ && args->group_dead) {
+    //
+    // **可移植性**：`args->group_dead` 是 mainline 6.8 才加到该 tracepoint 的
+    // 字段；5.15 LTS（含 WSL2 内核）上它不存在，整份脚本会因无法解析字段而
+    // 加载失败。bpftrace 内置量 `pid`(tgid) 与 `tid` 给出同样的答案：线程组
+    // 组长退出 == 进程退出（对 agent 工具派生的单线程命令完全等价）。
+    // aya 侧用 `bpf_get_current_pid_tgid()` 做同样的回退（见 src/ebpf/mod.rs）。
+    if (@@SRC_EXEC@@ && pid == tid) {
         printf("EXIT|%llu|%d|%d|%llu|%d|%s\n",
                nsecs, pid, curtask->real_parent->pid, cgroup,
                curtask->exit_code >> 8, comm);
     }
     // 只有最后一个线程退出才移除：per-thread 移除会把多线程 target 静默
     // 踢出 filter（pid 复用风险 v0 接受，见 §5.2）。
-    if (args->group_dead) {
+    if (pid == tid) {
         delete(@in_tree[pid]);
     }
 }

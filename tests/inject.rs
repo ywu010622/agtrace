@@ -272,9 +272,22 @@ fn run_agtrace_with_env(args: &[&str], env: &[(&str, &str)]) -> Run {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("cannot run the agtrace binary");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    // 失败必须让测试失败。没有这一条时，"二进制在写出任何东西之前就报错退出"的
+    // 运行会让所有"stdout 里没有 X"的断言在**空输出**上恒真 —— 曾经真的发生过
+    // （见 `write_tool_claim_without_kernel_is_unverified_not_mismatched`）。
+    assert!(
+        out.status.success(),
+        "agtrace exited with {} — the e2e assertions below assume a successful run\n\
+         --- command ---\n{:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status,
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
     Run {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        stderr,
     }
 }
 
@@ -328,6 +341,23 @@ impl Run {
     }
 }
 
+/// 行里是否出现**词边界**上的 `step N`。
+///
+/// 不能直接 `contains("step 1")`：它也会匹配 `step 12`，于是"这条失败落在第 1 步"
+/// 这种断言会在指向第 12 步的行上通过。步号后面要么是行尾，要么是非数字。
+fn points_at_step(line: &str, step: u64) -> bool {
+    let pat = format!("step {}", step);
+    let mut from = 0usize;
+    while let Some(i) = line[from..].find(&pat) {
+        let end = from + i + pat.len();
+        match line[end..].chars().next() {
+            Some(c) if c.is_ascii_digit() => from = end,
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// 断言"有一行 `XX` 指向第 step 步、工具是 `tool`"，并把它交回来。
 ///
 /// 步号是**这份流里 `tool.call` 的出现次序**（从 1 数）：它只跟 transcript 有关，
@@ -336,7 +366,7 @@ fn assert_points_at<'a>(run: &'a Run, step: u64, tool: &str, case: &str) -> &'a 
     let want = format!("step {}", step);
     run.fail_rows()
         .into_iter()
-        .find(|l| l.contains(&want) && l.contains(tool))
+        .find(|l| points_at_step(l, step) && l.contains(tool))
         .unwrap_or_else(|| {
             panic!(
                 "[{}] no `XX` row points at {} / {}\nrows: {:#?}\n--- stdout ---\n{}",
@@ -373,6 +403,15 @@ fn assert_line(run: &Run, case: &str, parts: &[&str]) {
         "[{}] no single line contains all of {:?}\n--- stdout ---\n{}",
         case, parts, run.stdout
     );
+}
+
+/// 解析 JSONL 的**最后一行**（契约：summary 在最后）。
+fn summary_json(stdout: &str) -> serde_json::Value {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .expect("the last json line must be the summary")
 }
 
 // ===============================================================
@@ -492,47 +531,90 @@ fn dishonest_fetch_claim_reports_no_outbound_connect() {
     run.assert_row_count(1, case);
 }
 
-/// Write 工具的一句结果（"Wrote X"），内核里**没有**那笔写。
+/// 没有 join key 的 Write 调用：结果里那句 "Wrote X" **不能被当成反证**。
 ///
-/// 这是 critical #1（`fail.rs::window_ok` 时钟域错配）的端到端回归：Write
-/// 工具不 spawn 进程，这个调用**没有任何**内核事件 —— `window_ok` 走的是
-/// 墙钟比较那条路，而不是 `kernel_events > 0` 的短路。修复前那条比较恒为假，
-/// 这句 claim 会被记成 `unverified`（悄悄放过），而不是这里断言的 `!!`。
+/// 这是 claim-vs-kernel 的"第二扇门"边界（DESIGN §14.2）：零内核事件、且没有
+/// argv 级绑定，说明的只是"这条调用没连上证据"，不是"内核里没有这次写"。
+/// 旧实现把这种空证据集渲染成 `!! claim-mismatch`，等于用"没证据"下否定结论；
+/// 修复后它只能是 unverified（计数见上一条测试的 JSON 断言）。
 #[test]
-fn dishonest_write_tool_claim_is_contradicted_by_the_kernel() {
+fn unlinked_write_tool_claim_is_unverified_not_mismatched() {
     let case = "dishonest-write-tool-claim";
-    // 回放没有 live pid 可绑定，`session_linked` 恒为 false —— 不开这个钩子，
-    // 零内核事件的 Write 调用永远到不了 `evaluate`，这个测试就恒为"无行"。
+    // 回放没有 live pid 可绑定 —— 这个钩子只影响会话级绑定，而本条调用没有
+    // join key，所以它仍必须是"不核对"，而不是"对不上"。
     let (run, _sc) =
         Seed::load(case).run_with_env(&[("AGTRACE_TEST_FORCE_PID_LINKED", "1")]);
 
-    let row = assert_points_at(&run, 1, "Write", case);
-    assert!(row.ends_with("!!"), "the row lost its `!!`:\n{}", row);
-    assert_line(
-        &run,
-        case,
-        &["claim:", "wrote", "report.pdf", "| kernel: no write open observed !!"],
-    );
-    run.assert_row_count(1, case);
-    assert_line(
-        &run,
-        case,
-        &["└─ output", "report.pdf", "referenced later by step 2 Read"],
-    );
+    run.assert_row_count(0, case);
+    run.must_not_contain("!!", case);
+    run.must_not_contain("claim:", case);
 }
 
-/// 没有内核源时，不许说 `!!`。
+/// 内核源在、但这条调用**一条内核事件都没有**时，不许说 `!!`。
 ///
-/// 这是上一条的反面（诚实边界）：`can_speak()` 的门槛没过，claim 只能记
-/// `unverified`。测试锁的是"不乱说话" —— 修 clock bug 的时候如果把门拆了，
-/// 这条会先叫。
+/// 这是上一条的反面（诚实边界）：`can_speak()` 的门槛没过（内核在看着，可这条
+/// 调用既没挂住事件，也没有会话级绑定），claim 只能记 `unverified`。测试锁的是
+/// "不乱说话" —— 修 clock bug 的时候如果把门拆了，这条会先叫。
+///
+/// 注意这里用的内核捕获是**合法但零事件**的（一行 TICK 心跳）。种子自带的
+/// `kernel.txt` 只有 CRLF，而 `KernelReplay::open` 拒绝"没有任何非空行"的回放
+/// （空回放与"目标什么都没干"在输出上无法区分）—— 于是二进制会在写出任何东西
+/// **之前**报错退出，而旧断言（stdout 0 条 XX、不含 `!!`）在空 stdout 上恒真。
+/// 那正是这条测试曾经"通过"的原因，不是它验证了 claim 门槛。
 #[test]
 fn write_tool_claim_without_kernel_is_unverified_not_mismatched() {
     let case = "unverified-write-tool-no-kernel";
-    let (run, _sc) = Seed::load(case).run();
+    let seed = Seed::load(case);
+    let sc = Scratch::new("unverified-no-kernel-events");
+    let (events, _) = seed.materialize(&sc, &Clock::new());
+    let transcript = sc.write("events.jsonl", &(events + "\n"));
+    // 合法回放（能被解析），但没有任何内核事件：Write 调用挂不到任何内核证据。
+    let kfile = sc.write("kernel.txt", "TICK|1000000000\n");
 
-    run.assert_row_count(0, case);
-    run.must_not_contain("!!", case);
+    let out = run_agtrace(&[
+        "--adapter",
+        "jsonl",
+        "-S",
+        &transcript,
+        "--kernel-lines",
+        &kfile,
+        "--output",
+        "json",
+    ]);
+    let summary = summary_json(&out.stdout);
+    let x = &summary["extra"];
+    assert_eq!(
+        x["claims"]["seen"], 1,
+        "the `Wrote <path>` claim must be seen: {}",
+        x["claims"]
+    );
+    assert_eq!(
+        x["claims"]["checked"], 0,
+        "a claim with no evidence and no session link must not be checked: {}",
+        x["claims"]
+    );
+    assert_eq!(
+        x["claims"]["unverified"], 1,
+        "it must be recorded as unverified (not silently passed): {}",
+        x["claims"]
+    );
+    assert_eq!(
+        x["claims"]["mismatched"], 0,
+        "no mismatch may be asserted without evidence: {}",
+        x["claims"]
+    );
+    assert_eq!(x["failures"]["count"], 0, "{}", x["failures"]);
+    assert_eq!(
+        x["failures"]["kernel_available"].as_bool(),
+        Some(true),
+        "this run did have a kernel source (a replayed capture): {}",
+        x["failures"]
+    );
+    assert!(
+        !out.stdout.contains("!!"),
+        "a claim that cannot be checked must stay silent, not get a `!!`:\n{}",
+        out.stdout
+    );
 }
 
 // ===============================================================
@@ -570,7 +652,7 @@ fn looping_fault_exposes_stale_successes() {
     }
     // 第 1 次是**真的**成功了 —— 它一条 `XX` 都不该有（否则就是冤枉）。
     assert!(
-        !run.fail_rows().iter().any(|r| r.contains("step 1")),
+        !run.fail_rows().iter().any(|r| points_at_step(r, 1)),
         "the first (honest) repeat must not be flagged: {:#?}",
         run.fail_rows()
     );
@@ -669,6 +751,84 @@ fn the_json_account_says_that_the_kernel_side_was_replayed() {
     assert_eq!(x["failures"]["list"][0]["step"], 1);
     assert_eq!(x["failures"]["list"][0]["class"], "claim-mismatch");
     assert!(x["replay"].is_object(), "replay must self-identify: {}", x["replay"]);
+}
+
+/// `--output json` 的**形状**契约：首行是结构化 header（`target` 是目标字段，
+/// 不是整段文本横幅；`sources`/`notes` 有值），中间每行是一条事件，末行是 summary。
+///
+/// 这曾经是坏的：唯一的写出口把 text 横幅整段塞进 JSON 的 `target`，而
+/// session/binding/sources/notes 全空 —— 下游按 JSON 解析，拿到的却是一段带换行
+/// 的人类文本。
+#[test]
+fn json_header_is_structured_and_summary_is_last() {
+    let seed = Seed::load("dishonest-write-claim");
+    let sc = Scratch::new("json-shape");
+    let (events, kernel) = seed.materialize(&sc, &Clock::new());
+    let transcript = sc.write("events.jsonl", &(events + "\n"));
+    let kfile = sc.write("kernel.txt", &(kernel + "\n"));
+
+    let out = run_agtrace(&[
+        "--adapter",
+        "jsonl",
+        "-S",
+        &transcript,
+        "--kernel-lines",
+        &kfile,
+        "--output",
+        "json",
+    ]);
+    let lines: Vec<&str> = out.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        lines.len() >= 3,
+        "expected header + at least one event + summary:\n{}",
+        out.stdout
+    );
+    let parse = |l: &str| {
+        serde_json::from_str::<serde_json::Value>(l)
+            .unwrap_or_else(|e| panic!("invalid JSONL line ({e}): {l:?}"))
+    };
+
+    let header = parse(lines[0]);
+    assert_eq!(header["agtrace"], "header", "first line must be the header: {header}");
+    let target = header["target"].as_str().expect("header.target must be a string");
+    assert!(
+        !target.contains('\n'),
+        "header.target must be a field, not the text banner: {target:?}"
+    );
+    assert!(
+        !target.starts_with("agtrace: target="),
+        "header.target is still the raw text banner: {target:?}"
+    );
+    assert!(
+        header["sources"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "sources must be populated for a replay run: {}",
+        header["sources"]
+    );
+    assert!(
+        header["notes"].as_array().is_some_and(|a| a
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.contains("--kernel-lines")))),
+        "the replay caveat must be a note, not prose inside target: {}",
+        header["notes"]
+    );
+    assert_eq!(header["following"].as_bool(), Some(false));
+
+    for l in &lines[1..lines.len() - 1] {
+        let ev = parse(l);
+        assert!(ev["kind"].is_string(), "every middle line is an event with a kind: {l:?}");
+        assert!(ev["layer"].is_string(), "every event carries its layer: {l:?}");
+    }
+    let summary = parse(lines[lines.len() - 1]);
+    assert_eq!(
+        summary["agtrace"], "summary",
+        "summary must be the last stdout line: {summary}"
+    );
+    assert!(
+        summary["total"].as_u64().unwrap_or(0) > 0,
+        "summary must count the events: {summary}"
+    );
 }
 
 /// 一条根本不存在的内核文件必须**报错退出**，不能安静地给出一条空时间线。

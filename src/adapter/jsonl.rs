@@ -41,6 +41,7 @@
 use super::{AdapterError, Capabilities, EventAdapter, FileTail, agent_event, parse_iso8601_ns};
 use crate::event::{Corr, Event, Kind, Layer, Payload, TruncNote, one_line, truncate_chars};
 use crate::poll::PollOutcome;
+use crate::redact::{RedactMode, redact_text};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -49,6 +50,8 @@ pub struct JsonlAdapter {
     follow: bool,
     done: bool,
     pub tool_preview_max: usize,
+    /// How `--redact` applies to this adapter (F2: it used to not apply at all).
+    redact: RedactMode,
     /// tool.call id → tool name, so tool.result rows can name their tool.
     call_tools: HashMap<String, String>,
     pub emitted: u64,
@@ -59,7 +62,12 @@ pub struct JsonlAdapter {
 }
 
 impl JsonlAdapter {
-    pub fn new(path: &str, tool_preview_max: usize, follow: bool) -> Result<Self, AdapterError> {
+    pub fn new(
+        path: &str,
+        tool_preview_max: usize,
+        follow: bool,
+        redact: RedactMode,
+    ) -> Result<Self, AdapterError> {
         let p = std::path::Path::new(path);
         if !p.is_file() && !follow {
             return Err(AdapterError::NotFound(format!(
@@ -72,6 +80,7 @@ impl JsonlAdapter {
             follow,
             done: false,
             tool_preview_max,
+            redact,
             call_tools: HashMap::new(),
             emitted: 0,
             bad_json: 0,
@@ -149,7 +158,19 @@ impl JsonlAdapter {
     }
 
     /// Preview helper: one_line + truncate, returns (preview, trunc notes).
+    ///
+    /// `--redact argv+content` additionally masks credentials in free-form content;
+    /// `--redact argv` only masks command fields (see the `tool.call` arm).
     fn preview(&self, s: &str, field: &str) -> (String, Vec<TruncNote>) {
+        let s = if self.redact.redacts_content() {
+            redact_text(s)
+        } else {
+            s.to_string()
+        };
+        self.preview_plain(&s, field)
+    }
+
+    fn preview_plain(&self, s: &str, field: &str) -> (String, Vec<TruncNote>) {
         let flat = one_line(s);
         let (p, cut, orig) = truncate_chars(&flat, self.tool_preview_max, self.tool_preview_max);
         let n = if cut {
@@ -181,23 +202,44 @@ impl JsonlAdapter {
             "tool.call" => {
                 let tool = Self::str_field(v, "tool").unwrap_or_else(|| "<unknown>".into());
                 let cmd = Self::str_field(v, "command");
-                let input_s = match v.get("input") {
+                let input_present = v.get("input").is_some();
+                let mut input_s = match v.get("input") {
                     Some(Value::String(s)) => s.clone(),
                     Some(other) => other.to_string(),
                     None => cmd.clone().unwrap_or_default(),
                 };
+                // F2: `command` is argv-shaped — it is masked under `--redact argv`
+                // (the default) **and** `argv+content`. `input` itself is content
+                // (masked only under `argv+content`), but when it is absent the
+                // input preview is the command verbatim — that case is a command
+                // field, so it is masked under `argv` too.
+                let input_bytes = input_s.len();
+                if self.redact.redacts_argv() && !input_present && cmd.is_some() {
+                    input_s = redact_text(&input_s);
+                }
                 let (p, n) = self.preview(&input_s, "input");
                 if let Some(id) = Self::str_field(v, "id") {
                     self.call_tools.insert(id, tool.clone());
                 }
+                let bash_cmd = if tool == "Bash" {
+                    cmd.map(|c| {
+                        if self.redact.redacts_argv() {
+                            redact_text(&c)
+                        } else {
+                            c
+                        }
+                    })
+                } else {
+                    None
+                };
                 Some((
                     Kind::AgentToolCall,
                     Payload::ToolCall {
                         tool: tool.clone(),
                         input_preview: p,
-                        input_bytes: input_s.len(),
+                        input_bytes,
                         via_mcp: tool.starts_with("mcp__"),
-                        bash_cmd: if tool == "Bash" { cmd } else { None },
+                        bash_cmd,
                     },
                     n,
                 ))
@@ -368,6 +410,14 @@ impl EventAdapter for JsonlAdapter {
         for (t, c) in types {
             d.push(format!("unknown type `{}` x{}", t, c));
         }
+        if self.tail.restarts > 0 {
+            d.push(format!(
+                "file tail: {} restart(s) (last: {}); {} possible duplicate event(s)",
+                self.tail.restarts,
+                self.tail.last_restart.as_deref().unwrap_or("-"),
+                self.tail.possible_duplicates
+            ));
+        }
         d
     }
 }
@@ -392,7 +442,7 @@ mod tests {
                 r#"{"type":"tool.result","id":"call_1","status":"success","output":"a\nb","ts":"2026-10-11T20:00:01.000Z"}"#,
             ],
         );
-        let mut a = JsonlAdapter::new(p.to_str().unwrap(), 512, false).unwrap();
+        let mut a = JsonlAdapter::new(p.to_str().unwrap(), 512, false, RedactMode::Argv).unwrap();
         let mut out = Vec::new();
         let r = a.poll(&mut out).unwrap();
         assert!(matches!(r, PollOutcome::Progress));
@@ -439,7 +489,7 @@ mod tests {
                 r#"not json"#,
             ],
         );
-        let mut a = JsonlAdapter::new(p.to_str().unwrap(), 512, false).unwrap();
+        let mut a = JsonlAdapter::new(p.to_str().unwrap(), 512, false, RedactMode::Argv).unwrap();
         let mut out = Vec::new();
         a.poll(&mut out).unwrap();
         assert_eq!(out.len(), 2);
@@ -455,13 +505,194 @@ mod tests {
 
     #[test]
     fn missing_file_offline_is_notfound() {
-        let r = JsonlAdapter::new("/tmp/agtrace_jsonl_nope_12345.jsonl", 512, false);
+        let r = JsonlAdapter::new(
+            "/tmp/agtrace_jsonl_nope_12345.jsonl",
+            512,
+            false,
+            RedactMode::Argv,
+        );
         assert!(matches!(r, Err(AdapterError::NotFound(_))));
     }
 
     #[test]
     fn missing_file_follow_is_allowed() {
-        let r = JsonlAdapter::new("/tmp/agtrace_jsonl_nope_12345.jsonl", 512, true);
+        let r = JsonlAdapter::new(
+            "/tmp/agtrace_jsonl_nope_12345.jsonl",
+            512,
+            true,
+            RedactMode::Argv,
+        );
         assert!(r.is_ok());
+    }
+
+    // ===========================================================
+    // F2：`--redact` 曾被完全丢弃 —— 自定义 agent 路径上 `argv` 和
+    // `argv+content` 都没有任何作用。
+    // ===========================================================
+
+    const SECRET: &str = "sk-secret-123456";
+
+    fn run_line(mode: RedactMode, line: &str) -> Vec<Event> {
+        // Rust runs tests in parallel threads of one process: the temp dir must be
+        // unique per call, not merely per process, or two tests clobber each other.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let uniq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agtrace_jsonl_redact_{}_{}_{}",
+            std::process::id(),
+            uniq,
+            mode.as_str()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("ev.jsonl");
+        std::fs::write(&p, format!("{}\n", line)).unwrap();
+        let mut a = JsonlAdapter::new(p.to_str().unwrap(), 512, false, mode).unwrap();
+        let mut out = Vec::new();
+        a.poll(&mut out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn tool_call(evs: &[Event]) -> &Payload {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                p @ Payload::ToolCall { .. } => Some(p),
+                _ => None,
+            })
+            .expect("no tool.call event")
+    }
+
+    fn prompt_text(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::Prompt { text_preview, .. } => Some(text_preview.as_str()),
+                _ => None,
+            })
+            .expect("no prompt event")
+    }
+
+    fn result_preview(evs: &[Event]) -> &str {
+        evs.iter()
+            .find_map(|e| match &e.payload {
+                Payload::ToolResult { result_preview, .. } => Some(result_preview.as_str()),
+                _ => None,
+            })
+            .expect("no tool.result event")
+    }
+
+    /// F2（HIGH）：`tool.call.command` 在 `argv` **和** `argv+content` 下都必须
+    /// 打码；`input` 缺省时 input preview 直接由 command 兜底，同样要打码。
+    #[test]
+    fn tool_call_command_is_redacted_under_argv_and_content() {
+        let line = format!(
+            r#"{{"type":"tool.call","id":"c1","tool":"Bash","command":"curl -H 'Authorization: Bearer {}' https://x","ts":"2026-10-11T20:00:00.000Z"}}"#,
+            SECRET
+        );
+        for mode in [RedactMode::Argv, RedactMode::ArgvContent] {
+            let evs = run_line(mode, &line);
+            match tool_call(&evs) {
+                Payload::ToolCall {
+                    bash_cmd,
+                    input_preview,
+                    ..
+                } => {
+                    let cmd = bash_cmd.as_deref().expect("bash_cmd");
+                    assert!(!cmd.contains(SECRET), "[{:?}] command 未打码: {}", mode, cmd);
+                    assert!(cmd.contains("***"), "[{:?}] 打码必须留痕: {}", mode, cmd);
+                    assert!(
+                        !input_preview.contains(SECRET),
+                        "[{:?}] command 兜底的 input preview 未打码: {}",
+                        mode,
+                        input_preview
+                    );
+                }
+                other => panic!("[{:?}] unexpected payload: {:?}", mode, other),
+            }
+        }
+        // `off` → verbatim（用户显式关掉时不自作主张）
+        let evs = run_line(RedactMode::Off, &line);
+        match tool_call(&evs) {
+            Payload::ToolCall { bash_cmd, .. } => {
+                assert!(bash_cmd.as_deref().unwrap().contains(SECRET))
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+    }
+
+    /// F2：`input`/`output`/`text` 是 content —— 只有 `argv+content` 打码。
+    #[test]
+    fn content_fields_only_redacted_under_argv_content() {
+        let prompt = format!(
+            r#"{{"type":"prompt","text":"run: curl -H 'Authorization: Bearer {}' https://x","ts":"2026-10-11T20:00:00.000Z"}}"#,
+            SECRET
+        );
+        let evs = run_line(RedactMode::Argv, &prompt);
+        assert!(prompt_text(&evs).contains(SECRET), "argv 模式不得打码 prompt");
+        let evs = run_line(RedactMode::ArgvContent, &prompt);
+        assert!(
+            !prompt_text(&evs).contains(SECRET),
+            "argv+content 必须打码 prompt: {}",
+            prompt_text(&evs)
+        );
+
+        let result = format!(
+            r#"{{"type":"tool.result","id":"c1","status":"success","output":"token={}","ts":"2026-10-11T20:00:00.000Z"}}"#,
+            SECRET
+        );
+        let evs = run_line(RedactMode::Argv, &result);
+        assert!(
+            result_preview(&evs).contains(SECRET),
+            "argv 模式不得打码 tool.result output"
+        );
+        let evs = run_line(RedactMode::ArgvContent, &result);
+        assert!(
+            !result_preview(&evs).contains(SECRET),
+            "argv+content 必须打码 tool.result output"
+        );
+    }
+
+    /// F2 scope：显式给出的 `input` 对象是 content（只在 `argv+content` 下打码）；
+    /// 独立 `command` 字段是 argv 形态（两种模式都打码）。
+    #[test]
+    fn provided_input_is_content_while_command_is_argv() {
+        let line = format!(
+            r#"{{"type":"tool.call","id":"c1","tool":"Bash","command":"curl -H 'Authorization: Bearer {}' https://x","input":{{"command":"postgres://user:pw@localhost/db"}},"ts":"2026-10-11T20:00:00.000Z"}}"#,
+            SECRET
+        );
+        let evs = run_line(RedactMode::Argv, &line);
+        match tool_call(&evs) {
+            Payload::ToolCall {
+                bash_cmd,
+                input_preview,
+                ..
+            } => {
+                assert!(
+                    !bash_cmd.as_deref().unwrap().contains(SECRET),
+                    "command 必须在 argv 模式下打码"
+                );
+                assert!(
+                    input_preview.contains("pw@localhost"),
+                    "input 是 content，argv 模式下不该被打码: {}",
+                    input_preview
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+        let evs = run_line(RedactMode::ArgvContent, &line);
+        match tool_call(&evs) {
+            Payload::ToolCall {
+                bash_cmd,
+                input_preview,
+                ..
+            } => {
+                assert!(!bash_cmd.as_deref().unwrap().contains(SECRET));
+                assert!(
+                    !input_preview.contains("pw@localhost"),
+                    "argv+content 下 input 必须打码: {}",
+                    input_preview
+                );
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
     }
 }
