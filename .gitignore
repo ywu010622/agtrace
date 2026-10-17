@@ -20,3 +20,7 @@ POLISH_*.log
 REVISE_*.md
 V0*.md
 *.cast
+
+# Python bytecode from helper scripts (py_compile / direct runs)
+__pycache__/
+*.pyc
