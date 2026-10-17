@@ -183,13 +183,7 @@ impl RawEvent {
     /// ~1.2 KiB temporary is materialised on the 512-byte eBPF stack.
     #[inline(always)]
     pub fn clear(&mut self) {
-        unsafe {
-            core::ptr::write_bytes(
-                self as *mut Self as *mut u8,
-                0,
-                core::mem::size_of::<Self>(),
-            )
-        }
+        unsafe { core::ptr::write_bytes(self as *mut Self as *mut u8, 0, core::mem::size_of::<Self>()) }
     }
 
     /// The `i`-th string as a byte slice, or `&[]` when the producer filled nothing.
@@ -213,12 +207,12 @@ impl RawEvent {
     /// Pack a byte count and a truncation flag into one `lens` slot.
     #[inline(always)]
     pub fn pack_len(n: usize, trunc: bool) -> u8 {
-        let n = if n > LEN_MASK as usize {
-            LEN_MASK
+        let n = if n > LEN_MASK as usize { LEN_MASK } else { n as u8 };
+        if trunc {
+            n | LEN_TRUNC
         } else {
-            n as u8
-        };
-        if trunc { n | LEN_TRUNC } else { n }
+            n
+        }
     }
 }
 
