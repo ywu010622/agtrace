@@ -27,10 +27,10 @@ toml = "1.1.8"
 # DSH session logs are concatenated Zstandard frames (see src/adapter/dsh.rs).
 # Frame *boundaries* are found structurally (a port of the DSH backend's own
 # scanner); this crate only decompresses the complete frames it is handed.
-zstd = "0.13"
+zstd = "0.14"
 # In-process eBPF loader (v0.5). Pure Rust — no libbpf, no C toolchain, which is
 # the whole point of dropping the `bpftrace` subprocess.
-aya = "0.14.0"
+aya = "0.16.0"
 # The record layout the eBPF programs fill in. Shared rather than duplicated so
 # the two sides cannot drift apart silently.
 agtrace-ebpf-common = { path = "agtrace-ebpf-common" }
